@@ -12,32 +12,44 @@ type Config struct {
 	BlockedIPs []string
 }
 
+type ipFilter struct {
+	skipper    func(*gin.Context) bool
+	blockedIPs map[string]struct{}
+	allowedIPs map[string]struct{}
+	hasAllowed bool
+}
+
 func New(cfg Config) gin.HandlerFunc {
+	f := &ipFilter{
+		skipper:    cfg.Skipper,
+		blockedIPs: make(map[string]struct{}, len(cfg.BlockedIPs)),
+		allowedIPs: make(map[string]struct{}, len(cfg.AllowedIPs)),
+		hasAllowed: len(cfg.AllowedIPs) > 0,
+	}
+
+	for _, ip := range cfg.BlockedIPs {
+		f.blockedIPs[ip] = struct{}{}
+	}
+	for _, ip := range cfg.AllowedIPs {
+		f.allowedIPs[ip] = struct{}{}
+	}
+
 	return func(c *gin.Context) {
-		if cfg.Skipper != nil && cfg.Skipper(c) {
+		if f.skipper != nil && f.skipper(c) {
 			c.Next()
 			return
 		}
 
 		clientIP := c.ClientIP()
 
-		for _, ip := range cfg.BlockedIPs {
-			if ip == clientIP {
-				c.String(http.StatusForbidden, "[403] ip blocked")
-				c.Abort()
-				return
-			}
+		if _, blocked := f.blockedIPs[clientIP]; blocked {
+			c.String(http.StatusForbidden, "[403] ip blocked")
+			c.Abort()
+			return
 		}
 
-		if len(cfg.AllowedIPs) > 0 {
-			allowed := false
-			for _, ip := range cfg.AllowedIPs {
-				if ip == clientIP {
-					allowed = true
-					break
-				}
-			}
-			if !allowed {
+		if f.hasAllowed {
+			if _, allowed := f.allowedIPs[clientIP]; !allowed {
 				c.String(http.StatusForbidden, "[403] ip not allowed")
 				c.Abort()
 				return

@@ -14,18 +14,40 @@ type APIKeyAuthConfig struct {
 	Validator  func(key string, c *gin.Context) bool
 }
 
+type apiKeyAuth struct {
+	skipper    func(*gin.Context) bool
+	headerName string
+	queryParam string
+	apiKeys    map[string]struct{}
+	hasAPIKeys bool
+	validator  func(key string, c *gin.Context) bool
+}
+
 func APIKeyAuth(cfg APIKeyAuthConfig) gin.HandlerFunc {
 	if cfg.HeaderName == "" {
 		cfg.HeaderName = "X-API-Key"
 	}
 
+	auth := &apiKeyAuth{
+		skipper:    cfg.Skipper,
+		headerName: cfg.HeaderName,
+		queryParam: cfg.QueryParam,
+		apiKeys:    make(map[string]struct{}, len(cfg.APIKeys)),
+		hasAPIKeys: len(cfg.APIKeys) > 0,
+		validator:  cfg.Validator,
+	}
+
+	for _, k := range cfg.APIKeys {
+		auth.apiKeys[k] = struct{}{}
+	}
+
 	return func(c *gin.Context) {
-		if cfg.Skipper != nil && cfg.Skipper(c) {
+		if auth.skipper != nil && auth.skipper(c) {
 			c.Next()
 			return
 		}
 
-		key := extractAPIKey(c, cfg)
+		key := extractAPIKey(c, auth.headerName, auth.queryParam)
 		if key == "" {
 			c.String(http.StatusUnauthorized, "[401] unauthorized, reason: missing api key")
 			c.Abort()
@@ -33,15 +55,10 @@ func APIKeyAuth(cfg APIKeyAuthConfig) gin.HandlerFunc {
 		}
 
 		valid := false
-		if cfg.Validator != nil {
-			valid = cfg.Validator(key, c)
-		} else if cfg.APIKeys != nil {
-			for _, k := range cfg.APIKeys {
-				if k == key {
-					valid = true
-					break
-				}
-			}
+		if auth.validator != nil {
+			valid = auth.validator(key, c)
+		} else if auth.hasAPIKeys {
+			_, valid = auth.apiKeys[key]
 		}
 
 		if !valid {
@@ -54,16 +71,16 @@ func APIKeyAuth(cfg APIKeyAuthConfig) gin.HandlerFunc {
 	}
 }
 
-func extractAPIKey(c *gin.Context, cfg APIKeyAuthConfig) string {
-	if cfg.QueryParam != "" {
-		key := c.Query(cfg.QueryParam)
+func extractAPIKey(c *gin.Context, headerName, queryParam string) string {
+	if queryParam != "" {
+		key := c.Query(queryParam)
 		if key != "" {
 			return key
 		}
 	}
 
-	if cfg.HeaderName != "" {
-		key := c.GetHeader(cfg.HeaderName)
+	if headerName != "" {
+		key := c.GetHeader(headerName)
 		if key != "" {
 			return key
 		}
