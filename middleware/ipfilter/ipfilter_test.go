@@ -1,4 +1,4 @@
-package iplimiter
+package ipfilter
 
 import (
 	"net/http"

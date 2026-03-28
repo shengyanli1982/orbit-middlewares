@@ -1,8 +1,11 @@
 module github.com/shengyanli1982/orbit-middlewares
 
-go 1.20
+go 1.21
+
+toolchain go1.24.13
 
 require (
+	github.com/allegro/bigcache/v3 v3.1.0
 	github.com/gin-gonic/gin v1.10.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/stretchr/testify v1.11.1

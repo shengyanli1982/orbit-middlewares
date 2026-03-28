@@ -10,13 +10,40 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestRateLimiter_Basic(t *testing.T) {
+func TestRateLimiter_GlobalMode(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	cfg := Config{
+		Mode:  ModeGlobal,
 		QPS:   1,
 		Burst: 1,
-		KeyExtractor: func(*gin.Context) string {
+	}
+
+	router := gin.New()
+	router.Use(New(cfg))
+	router.GET("/test", func(c *gin.Context) {
+		c.String(http.StatusOK, "ok")
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	assert.Equal(t, http.StatusOK, recorder.Code)
+
+	req2 := httptest.NewRequest(http.MethodGet, "/test", nil)
+	recorder2 := httptest.NewRecorder()
+	router.ServeHTTP(recorder2, req2)
+	assert.Equal(t, http.StatusTooManyRequests, recorder2.Code)
+}
+
+func TestRateLimiter_IPMode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := Config{
+		Mode:  ModeIP,
+		QPS:   1,
+		Burst: 1,
+		IPExtractor: func(*gin.Context) string {
 			return "test-key"
 		},
 	}
@@ -30,25 +57,21 @@ func TestRateLimiter_Basic(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, req)
-
 	assert.Equal(t, http.StatusOK, recorder.Code)
 
 	req2 := httptest.NewRequest(http.MethodGet, "/test", nil)
 	recorder2 := httptest.NewRecorder()
 	router.ServeHTTP(recorder2, req2)
-
 	assert.Equal(t, http.StatusTooManyRequests, recorder2.Code)
 }
 
-func TestRateLimiter_DifferentKeys(t *testing.T) {
+func TestRateLimiter_DifferentIPs(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	cfg := Config{
+		Mode:  ModeIP,
 		QPS:   1,
 		Burst: 1,
-		KeyExtractor: func(c *gin.Context) string {
-			return c.ClientIP()
-		},
 	}
 
 	router := gin.New()
@@ -75,9 +98,10 @@ func TestRateLimiter_RefillTokens(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	cfg := Config{
+		Mode:  ModeIP,
 		QPS:   1,
 		Burst: 1,
-		KeyExtractor: func(*gin.Context) string {
+		IPExtractor: func(*gin.Context) string {
 			return "test-key"
 		},
 	}
@@ -110,9 +134,10 @@ func TestRateLimiter_Skipper(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	cfg := Config{
-		QPS:   0,
+		Mode:  ModeIP,
+		QPS:   1,
 		Burst: 0,
-		KeyExtractor: func(*gin.Context) string {
+		IPExtractor: func(*gin.Context) string {
 			return "test-key"
 		},
 		Skipper: func(c *gin.Context) bool {
