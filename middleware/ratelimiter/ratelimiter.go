@@ -37,6 +37,7 @@ type limiter struct {
 	global     *rate.Limiter
 	ipCache    *bigcache.BigCache
 	ipLimiters sync.Map
+	mu         sync.Mutex
 }
 
 func New(cfg Config) gin.HandlerFunc {
@@ -98,12 +99,15 @@ func New(cfg Config) gin.HandlerFunc {
 }
 
 func (l *limiter) allowIP(key string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	now := time.Now()
 
 	if v, ok := l.ipLimiters.Load(key); ok {
 		il := v.(*ipLimiter)
 		il.lastSeen = now
-		l.ipCache.Set(key, []byte("1"))
+		_ = l.ipCache.Set(key, []byte("1"))
 		return il.limiter.Allow()
 	}
 
@@ -112,7 +116,7 @@ func (l *limiter) allowIP(key string) bool {
 		lastSeen: now,
 	}
 	l.ipLimiters.Store(key, il)
-	l.ipCache.Set(key, []byte("1"))
+	_ = l.ipCache.Set(key, []byte("1"))
 	return il.limiter.Allow()
 }
 
@@ -121,11 +125,11 @@ func (l *limiter) cleanupExpired() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		l.ipLimiters.Range(func(key, value interface{}) bool {
+		l.ipLimiters.Range(func(key, value any) bool {
 			il := value.(*ipLimiter)
 			if time.Since(il.lastSeen) > l.cfg.TTL {
 				l.ipLimiters.Delete(key)
-				l.ipCache.Delete(key.(string))
+				_ = l.ipCache.Delete(key.(string))
 			}
 			return true
 		})
