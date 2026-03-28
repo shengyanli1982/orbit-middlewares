@@ -41,10 +41,12 @@ go get github.com/shengyanli1982/orbit-middlewares
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/shengyanli1982/orbit"
 	"github.com/shengyanli1982/orbit-middlewares/middleware/auth"
 	"github.com/shengyanli1982/orbit-middlewares/middleware/ipfilter"
 	"github.com/shengyanli1982/orbit-middlewares/middleware/ratelimiter"
@@ -53,38 +55,48 @@ import (
 	"github.com/shengyanli1982/orbit-middlewares/middleware/timeout"
 )
 
-func main() {
-	r := gin.Default()
+type DemoService struct{}
 
-	r.Use(requestid.RequestID())
-	r.Use(ipfilter.New(ipfilter.Config{
-		BlockedIPs: []string{"192.168.1.100"},
-	}))
-	r.Use(requestsize.New(requestsize.Config{
-		MaxSize: 10 * 1024 * 1024,
-	}))
-	r.Use(timeout.New(timeout.Config{
-		Timeout: 10 * time.Second,
-	}))
-	r.Use(ratelimiter.New(ratelimiter.Config{
-		Mode:  ratelimiter.ModeIP,
-		QPS:   100,
-		Burst: 200,
-	}))
-	r.Use(auth.APIKeyAuth(auth.APIKeyAuthConfig{
-		HeaderName: "X-API-Key",
-		APIKeys:    []string{"admin-key", "user-key"},
-	}))
-
-	r.GET("/ping", func(c *gin.Context) {
+func (s *DemoService) RegisterGroup(g *gin.RouterGroup) {
+	g.GET("/ping", func(c *gin.Context) {
 		requestID, _ := c.Get("request_id")
 		c.JSON(http.StatusOK, gin.H{
 			"message":    "pong",
 			"request_id": requestID,
 		})
 	})
+}
 
-	r.Run(":8080")
+func main() {
+	config := orbit.NewConfig()
+	opts := orbit.NewOptions()
+	engine := orbit.NewEngine(config, opts)
+
+	engine.RegisterMiddleware(requestid.RequestID())
+	engine.RegisterMiddleware(ipfilter.New(ipfilter.Config{
+		BlockedIPs: []string{"192.168.1.100"},
+	}))
+	engine.RegisterMiddleware(requestsize.New(requestsize.Config{
+		MaxSize: 10 * 1024 * 1024,
+	}))
+	engine.RegisterMiddleware(timeout.New(timeout.Config{
+		Timeout: 10 * time.Second,
+	}))
+	engine.RegisterMiddleware(ratelimiter.New(ratelimiter.Config{
+		Mode:  ratelimiter.ModeIP,
+		QPS:   100,
+		Burst: 200,
+	}))
+	engine.RegisterMiddleware(auth.APIKeyAuth(auth.APIKeyAuthConfig{
+		HeaderName: "X-API-Key",
+		APIKeys:    []string{"admin-key", "user-key"},
+	}))
+
+	engine.RegisterService(&DemoService{})
+
+	engine.Run()
+	time.Sleep(30 * time.Second)
+	engine.Stop()
 }
 ```
 
