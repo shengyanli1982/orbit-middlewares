@@ -37,7 +37,6 @@ type limiter struct {
 	global     *rate.Limiter
 	ipCache    *bigcache.BigCache
 	ipLimiters sync.Map
-	mu         sync.Mutex
 }
 
 func New(cfg Config) gin.HandlerFunc {
@@ -99,9 +98,6 @@ func New(cfg Config) gin.HandlerFunc {
 }
 
 func (l *limiter) allowIP(key string) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	now := time.Now()
 
 	if v, ok := l.ipLimiters.Load(key); ok {
