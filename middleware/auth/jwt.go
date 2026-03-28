@@ -14,9 +14,13 @@ type JWTAuthConfig struct {
 	KeyFunc jwt.Keyfunc
 }
 
+// JWTAuth JWT认证中间件
+// keyfunc在handler外部创建一次，避免每次请求都分配闭包
 func JWTAuth(cfg JWTAuthConfig) gin.HandlerFunc {
 	keyFunc := cfg.KeyFunc
 	if keyFunc == nil {
+		// 未提供KeyFunc时，创建默认的HMAC验证闭包
+		// secret通过值捕获而非引用，避免闭包捕获指针问题
 		secret := cfg.Secret
 		keyFunc = func(token *jwt.Token) (any, error) {
 			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {

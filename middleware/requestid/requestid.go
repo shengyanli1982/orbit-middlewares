@@ -58,6 +58,9 @@ func RequestID(opts ...Option) gin.HandlerFunc {
 	return New(cfg)
 }
 
+// generateID 生成一个16字节的随机ID，使用hex编码
+// 使用 crypto/rand 确保密码学安全的随机数
+// hex.EncodeToString 比 fmt.Sprintf 更高效，减少内存分配
 func generateID() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)

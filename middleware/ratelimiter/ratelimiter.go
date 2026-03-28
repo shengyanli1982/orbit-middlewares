@@ -31,6 +31,9 @@ type ipLimiter struct {
 	lastSeen time.Time
 }
 
+// limiter 限流器实例
+// ipCache: freecache缓存，用于快速判断IP是否见过（比bigcache更高效）
+// ipLimiters: 存储每个IP的限流器实例，使用sync.Map支持并发安全
 type limiter struct {
 	cfg        Config
 	global     *rate.Limiter
@@ -93,6 +96,10 @@ func New(cfg Config) gin.HandlerFunc {
 	}
 }
 
+// allowIP 检查并更新IP的限流状态
+// 1. 先查sync.Map获取该IP的limiter
+// 2. 同时更新freecache中的时间戳（用于cleanupExpired判断过期）
+// 3. 调用rate.Limiter.Allow()检查是否允许通过
 func (l *limiter) allowIP(key string) bool {
 	now := time.Now()
 
@@ -103,6 +110,7 @@ func (l *limiter) allowIP(key string) bool {
 		return il.limiter.Allow()
 	}
 
+	// 新IP，创建新的limiter并缓存
 	il := &ipLimiter{
 		limiter:  rate.NewLimiter(rate.Limit(l.cfg.QPS), l.cfg.Burst),
 		lastSeen: now,
@@ -112,6 +120,9 @@ func (l *limiter) allowIP(key string) bool {
 	return il.limiter.Allow()
 }
 
+// cleanupExpired 后台goroutine定期清理过期的IP限流记录
+// 每分钟执行一次，删除超过TTL未被访问的IP记录
+// 同时清理sync.Map和freecache中的数据
 func (l *limiter) cleanupExpired() {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
