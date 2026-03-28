@@ -12,6 +12,10 @@ type Config struct {
 	BlockedIPs []string
 }
 
+// ipFilter IP过滤器，使用map存储实现O(1)查找
+// blockedIPs: 黑名单IP集合
+// allowedIPs: 白名单IP集合（若为空则不启用白名单）
+// hasAllowed: 标记是否启用了白名单模式
 type ipFilter struct {
 	skipper    func(*gin.Context) bool
 	blockedIPs map[string]struct{}
