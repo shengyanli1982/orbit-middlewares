@@ -16,6 +16,11 @@ const (
 	ModeIP
 )
 
+const (
+	// numShards 分片数量，使用 256 个分片
+	numShards = 256
+)
+
 type Config struct {
 	Skipper     func(*gin.Context) bool
 	Mode        Mode
@@ -31,12 +36,12 @@ type ipLimiter struct {
 }
 
 // limiter 限流器实例
-// ipLimiters: 存储每个IP的限流器，使用sync.Map支持并发安全
-// 使用 lastSeen 字段追踪最后访问时间，用于TTL过期判断
+// 使用分片 map 减少锁竞争
+// 每个分片独立 sync.Map，减少同一把锁的竞争
 type limiter struct {
-	cfg        Config
-	global     *rate.Limiter
-	ipLimiters sync.Map
+	cfg    Config
+	global *rate.Limiter
+	shards [numShards]sync.Map
 }
 
 func New(cfg Config) gin.HandlerFunc {
@@ -92,14 +97,42 @@ func New(cfg Config) gin.HandlerFunc {
 	}
 }
 
-// allowIP 检查并更新IP的限流状态
-// 1. 先查sync.Map获取该IP的limiter
-// 2. 更新lastSeen时间
-// 3. 调用rate.Limiter.Allow()检查是否允许通过
-func (l *limiter) allowIP(key string) bool {
-	now := time.Now()
+// extractLastOctet 从 IP:port 格式中提取最后一个 octet
+// 例如 "192.168.1.5:1234" -> 5
+func extractLastOctet(ipStr string) int {
+	// 找到倒数第二个点的位置
+	n := len(ipStr)
+	for i := n - 1; i >= 0; i-- {
+		if ipStr[i] == '.' {
+			// 找到最后一个点的位置，返回其后的数字
+			val := 0
+			mul := 1
+			for j := n - 1; j > i; j-- {
+				if ipStr[j] >= '0' && ipStr[j] <= '9' {
+					val += int(ipStr[j]-'0') * mul
+					mul *= 10
+				} else {
+					break
+				}
+			}
+			return val
+		}
+	}
+	return 0
+}
 
-	if v, ok := l.ipLimiters.Load(key); ok {
+// getShard 根据 IP 获取对应的分片索引
+func getShardIndex(ipStr string) int {
+	return extractLastOctet(ipStr) % numShards
+}
+
+// allowIP 检查并更新IP的限流状态
+func (l *limiter) allowIP(ipStr string) bool {
+	now := time.Now()
+	shardIdx := getShardIndex(ipStr)
+
+	// 尝试从当前分片加载
+	if v, ok := l.shards[shardIdx].Load(ipStr); ok {
 		il := v.(*ipLimiter)
 		il.lastSeen = now
 		return il.limiter.Allow()
@@ -110,29 +143,29 @@ func (l *limiter) allowIP(key string) bool {
 		limiter:  rate.NewLimiter(rate.Limit(l.cfg.QPS), l.cfg.Burst),
 		lastSeen: now,
 	}
-	l.ipLimiters.Store(key, il)
+	l.shards[shardIdx].Store(ipStr, il)
 	return il.limiter.Allow()
 }
 
 // cleanupExpired 后台goroutine定期清理过期的IP限流记录
-// 每分钟执行一次，删除超过TTL未被访问的IP记录
 func (l *limiter) cleanupExpired() {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		l.ipLimiters.Range(func(key, value any) bool {
-			il := value.(*ipLimiter)
-			if time.Since(il.lastSeen) > l.cfg.TTL {
-				l.ipLimiters.Delete(key)
-			}
-			return true
-		})
+		for i := range l.shards {
+			l.shards[i].Range(func(key, value any) bool {
+				il := value.(*ipLimiter)
+				if time.Since(il.lastSeen) > l.cfg.TTL {
+					l.shards[i].Delete(key)
+				}
+				return true
+			})
+		}
 	}
 }
 
 // formatFloat 将QPS转换为字符串
-// 对于 >= 1 的QPS返回 "1"，否则返回 "0"
 func formatFloat(f float64) string {
 	if f >= 1 {
 		return "1"
