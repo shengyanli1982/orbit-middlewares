@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coocood/freecache"
 	"github.com/gin-gonic/gin"
 )
 
@@ -157,7 +156,6 @@ func BenchmarkRateLimiter_AllowIP(b *testing.B) {
 			Burst: 10,
 			TTL:   5 * time.Minute,
 		},
-		ipCache: freecache.NewCache(256 * 1024 * 1024),
 	}
 
 	f, err := os.Create("ratelimiter_allowip_cpu.prof")

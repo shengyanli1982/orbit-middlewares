@@ -5,7 +5,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coocood/freecache"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/time/rate"
 )
@@ -32,12 +31,11 @@ type ipLimiter struct {
 }
 
 // limiter 限流器实例
-// ipCache: freecache缓存，用于快速判断IP是否见过（比bigcache更高效）
-// ipLimiters: 存储每个IP的限流器实例，使用sync.Map支持并发安全
+// ipLimiters: 存储每个IP的限流器，使用sync.Map支持并发安全
+// 使用 lastSeen 字段追踪最后访问时间，用于TTL过期判断
 type limiter struct {
 	cfg        Config
 	global     *rate.Limiter
-	ipCache    *freecache.Cache
 	ipLimiters sync.Map
 }
 
@@ -52,14 +50,12 @@ func New(cfg Config) gin.HandlerFunc {
 		cfg.TTL = 5 * time.Minute
 	}
 
-	ipCache := freecache.NewCache(256 * 1024 * 1024)
-
 	l := &limiter{
-		cfg:     cfg,
-		global:  rate.NewLimiter(rate.Limit(cfg.QPS), cfg.Burst),
-		ipCache: ipCache,
+		cfg:    cfg,
+		global: rate.NewLimiter(rate.Limit(cfg.QPS), cfg.Burst),
 	}
 
+	// 启动后台清理goroutine
 	go l.cleanupExpired()
 
 	return func(c *gin.Context) {
@@ -98,7 +94,7 @@ func New(cfg Config) gin.HandlerFunc {
 
 // allowIP 检查并更新IP的限流状态
 // 1. 先查sync.Map获取该IP的limiter
-// 2. 同时更新freecache中的时间戳（用于cleanupExpired判断过期）
+// 2. 更新lastSeen时间
 // 3. 调用rate.Limiter.Allow()检查是否允许通过
 func (l *limiter) allowIP(key string) bool {
 	now := time.Now()
@@ -106,23 +102,20 @@ func (l *limiter) allowIP(key string) bool {
 	if v, ok := l.ipLimiters.Load(key); ok {
 		il := v.(*ipLimiter)
 		il.lastSeen = now
-		_ = l.ipCache.Set([]byte(key), []byte("1"), int(l.cfg.TTL.Seconds()))
 		return il.limiter.Allow()
 	}
 
-	// 新IP，创建新的limiter并缓存
+	// 新IP，创建新的limiter
 	il := &ipLimiter{
 		limiter:  rate.NewLimiter(rate.Limit(l.cfg.QPS), l.cfg.Burst),
 		lastSeen: now,
 	}
 	l.ipLimiters.Store(key, il)
-	_ = l.ipCache.Set([]byte(key), []byte("1"), int(l.cfg.TTL.Seconds()))
 	return il.limiter.Allow()
 }
 
 // cleanupExpired 后台goroutine定期清理过期的IP限流记录
 // 每分钟执行一次，删除超过TTL未被访问的IP记录
-// 同时清理sync.Map和freecache中的数据
 func (l *limiter) cleanupExpired() {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
@@ -132,13 +125,14 @@ func (l *limiter) cleanupExpired() {
 			il := value.(*ipLimiter)
 			if time.Since(il.lastSeen) > l.cfg.TTL {
 				l.ipLimiters.Delete(key)
-				_ = l.ipCache.Del([]byte(key.(string)))
 			}
 			return true
 		})
 	}
 }
 
+// formatFloat 将QPS转换为字符串
+// 对于 >= 1 的QPS返回 "1"，否则返回 "0"
 func formatFloat(f float64) string {
 	if f >= 1 {
 		return "1"
