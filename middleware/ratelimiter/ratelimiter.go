@@ -97,31 +97,36 @@ func New(cfg Config) gin.HandlerFunc {
 	}
 }
 
-// extractLastOctet 从 IP:port 格式中提取最后一个 octet
-// 例如 "192.168.1.5:1234" -> 5
+//go:inline
 func extractLastOctet(ipStr string) int {
-	// 找到倒数第二个点的位置
-	n := len(ipStr)
-	for i := n - 1; i >= 0; i-- {
-		if ipStr[i] == '.' {
-			// 找到最后一个点的位置，返回其后的数字
-			val := 0
-			mul := 1
-			for j := n - 1; j > i; j-- {
-				if ipStr[j] >= '0' && ipStr[j] <= '9' {
-					val += int(ipStr[j]-'0') * mul
-					mul *= 10
-				} else {
-					break
-				}
-			}
-			return val
-		}
+	// 使用 byte slice 避免 string bounds check overhead
+	b := []byte(ipStr)
+	n := len(b)
+
+	// 从后向前找到 '.'
+	p := n - 1
+	for p >= 0 && b[p] != '.' {
+		p--
 	}
-	return 0
+	if p < 0 {
+		return 0
+	}
+	p++
+
+	// 解析数字，遇到非数字停止
+	result := 0
+	for p < n {
+		c := b[p]
+		if c < '0' || c > '9' {
+			break
+		}
+		result = result*10 + int(c-'0')
+		p++
+	}
+	return result
 }
 
-// getShard 根据 IP 获取对应的分片索引
+//go:inline
 func getShardIndex(ipStr string) int {
 	return extractLastOctet(ipStr) % numShards
 }
