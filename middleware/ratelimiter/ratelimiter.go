@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/time/rate"
@@ -97,13 +98,26 @@ func New(cfg Config) gin.HandlerFunc {
 	}
 }
 
+// StringToBytes 将字符串转换为字节切片（零拷贝）。
+// 注意：返回切片只允许只读访问，不可修改。
+func StringToBytes(s string) []byte {
+	if len(s) == 0 {
+		return nil
+	}
+
+	x := (*[2]uintptr)(unsafe.Pointer(&s))
+	h := [3]uintptr{x[0], x[1], x[1]}
+	return *(*[]byte)(unsafe.Pointer(&h))
+}
+
 //go:inline
 func extractLastOctet(ipStr string) int {
-	// 使用 byte slice 避免 string bounds check overhead
-	b := []byte(ipStr)
+	b := StringToBytes(ipStr)
 	n := len(b)
+	if n == 0 {
+		return 0
+	}
 
-	// 从后向前找到 '.'
 	p := n - 1
 	for p >= 0 && b[p] != '.' {
 		p--
@@ -113,7 +127,6 @@ func extractLastOctet(ipStr string) int {
 	}
 	p++
 
-	// 解析数字，遇到非数字停止
 	result := 0
 	for p < n {
 		c := b[p]
