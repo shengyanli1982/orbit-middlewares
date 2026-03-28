@@ -1,7 +1,9 @@
 package ratelimiter
 
 import (
+	"math"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 	"unsafe"
@@ -71,9 +73,20 @@ func New(cfg Config) gin.HandlerFunc {
 		}
 
 		if cfg.Mode == ModeGlobal {
-			if !l.global.Allow() {
-				c.Header("X-RateLimit-Limit", formatFloat(cfg.QPS))
-				c.Header("Retry-After", "1")
+			r := l.global.Reserve()
+			// Reserve OK() == false: 请求的 token 数超过了 burst 上限（非常罕见）
+			if !r.OK() {
+				c.Header("X-RateLimit-Limit", strconv.Itoa(int(math.Ceil(cfg.QPS))))
+				c.Header("Retry-After", "0")
+				c.String(http.StatusTooManyRequests, "[429] rate limit exceeded")
+				c.Abort()
+				return
+			}
+			// Reserve Delay() > 0: bucket 中当前没有可用 token，需要等待补充
+			if r.Delay() > 0 {
+				r.Cancel()
+				c.Header("X-RateLimit-Limit", strconv.Itoa(int(math.Ceil(cfg.QPS))))
+				c.Header("Retry-After", strconv.FormatInt(int64(math.Ceil(r.Delay().Seconds())), 10))
 				c.String(http.StatusTooManyRequests, "[429] rate limit exceeded")
 				c.Abort()
 				return
@@ -85,9 +98,20 @@ func New(cfg Config) gin.HandlerFunc {
 				return
 			}
 
-			if !l.allowIP(key) {
-				c.Header("X-RateLimit-Limit", formatFloat(cfg.QPS))
-				c.Header("Retry-After", "1")
+			ok, delay, r := l.allowIP(key)
+			// Reserve OK() == false: 请求的 token 数超过了 burst 上限（非常罕见）
+			if !ok {
+				c.Header("X-RateLimit-Limit", strconv.Itoa(int(math.Ceil(cfg.QPS))))
+				c.Header("Retry-After", "0")
+				c.String(http.StatusTooManyRequests, "[429] rate limit exceeded")
+				c.Abort()
+				return
+			}
+			// Reserve Delay() > 0: bucket 中当前没有可用 token，需要等待补充
+			if delay > 0 {
+				r.Cancel()
+				c.Header("X-RateLimit-Limit", strconv.Itoa(int(math.Ceil(cfg.QPS))))
+				c.Header("Retry-After", strconv.FormatInt(int64(math.Ceil(delay.Seconds())), 10))
 				c.String(http.StatusTooManyRequests, "[429] rate limit exceeded")
 				c.Abort()
 				return
@@ -145,24 +169,34 @@ func getShardIndex(ipStr string) int {
 }
 
 // allowIP 检查并更新IP的限流状态
-func (l *limiter) allowIP(ipStr string) bool {
+// 返回值: (是否可放行, 等待时间, Reservation)
+//   - ok=false: 请求的 token 数超过了 burst 上限（非常罕见）
+//   - delay>0: bucket 中没有可用 token，需要等待
+//   - delay==0 && ok==true: 可以立即放行
+func (l *limiter) allowIP(ipStr string) (bool, time.Duration, *rate.Reservation) {
 	now := time.Now()
 	shardIdx := getShardIndex(ipStr)
 
-	// 尝试从当前分片加载
 	if v, ok := l.shards[shardIdx].Load(ipStr); ok {
 		il := v.(*ipLimiter)
 		il.lastSeen = now
-		return il.limiter.Allow()
+		r := il.limiter.Reserve()
+		if !r.OK() {
+			return false, 0, nil
+		}
+		return true, r.Delay(), r
 	}
 
-	// 新IP，创建新的limiter
 	il := &ipLimiter{
 		limiter:  rate.NewLimiter(rate.Limit(l.cfg.QPS), l.cfg.Burst),
 		lastSeen: now,
 	}
 	l.shards[shardIdx].Store(ipStr, il)
-	return il.limiter.Allow()
+	r := il.limiter.Reserve()
+	if !r.OK() {
+		return false, 0, nil
+	}
+	return true, r.Delay(), r
 }
 
 func (l *limiter) cleanupExpired() {
@@ -191,12 +225,4 @@ func (l *limiter) Stop() {
 	l.stopOnce.Do(func() {
 		close(l.stopCh)
 	})
-}
-
-// formatFloat 将QPS转换为字符串
-func formatFloat(f float64) string {
-	if f >= 1 {
-		return "1"
-	}
-	return "0"
 }
