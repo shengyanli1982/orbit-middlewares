@@ -36,13 +36,12 @@ type ipLimiter struct {
 	lastSeen time.Time
 }
 
-// limiter 限流器实例
-// 使用分片 map 减少锁竞争
-// 每个分片独立 sync.Map，减少同一把锁的竞争
 type limiter struct {
-	cfg    Config
-	global *rate.Limiter
-	shards [numShards]sync.Map
+	cfg      Config
+	global   *rate.Limiter
+	shards   [numShards]sync.Map
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 func New(cfg Config) gin.HandlerFunc {
@@ -59,6 +58,7 @@ func New(cfg Config) gin.HandlerFunc {
 	l := &limiter{
 		cfg:    cfg,
 		global: rate.NewLimiter(rate.Limit(cfg.QPS), cfg.Burst),
+		stopCh: make(chan struct{}),
 	}
 
 	// 启动后台清理goroutine
@@ -165,22 +165,32 @@ func (l *limiter) allowIP(ipStr string) bool {
 	return il.limiter.Allow()
 }
 
-// cleanupExpired 后台goroutine定期清理过期的IP限流记录
 func (l *limiter) cleanupExpired() {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		for i := range l.shards {
-			l.shards[i].Range(func(key, value any) bool {
-				il := value.(*ipLimiter)
-				if time.Since(il.lastSeen) > l.cfg.TTL {
-					l.shards[i].Delete(key)
-				}
-				return true
-			})
+	for {
+		select {
+		case <-l.stopCh:
+			return
+		case <-ticker.C:
+			for i := range l.shards {
+				l.shards[i].Range(func(key, value any) bool {
+					il := value.(*ipLimiter)
+					if time.Since(il.lastSeen) > l.cfg.TTL {
+						l.shards[i].Delete(key)
+					}
+					return true
+				})
+			}
 		}
 	}
+}
+
+func (l *limiter) Stop() {
+	l.stopOnce.Do(func() {
+		close(l.stopCh)
+	})
 }
 
 // formatFloat 将QPS转换为字符串
