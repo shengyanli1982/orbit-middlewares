@@ -1,12 +1,11 @@
 package ratelimiter
 
 import (
-	"context"
 	"net/http"
 	"sync"
 	"time"
 
-	"github.com/allegro/bigcache/v3"
+	"github.com/coocood/freecache"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/time/rate"
 )
@@ -35,7 +34,7 @@ type ipLimiter struct {
 type limiter struct {
 	cfg        Config
 	global     *rate.Limiter
-	ipCache    *bigcache.BigCache
+	ipCache    *freecache.Cache
 	ipLimiters sync.Map
 }
 
@@ -50,10 +49,7 @@ func New(cfg Config) gin.HandlerFunc {
 		cfg.TTL = 5 * time.Minute
 	}
 
-	ipCache, err := bigcache.New(context.Background(), bigcache.DefaultConfig(cfg.TTL))
-	if err != nil {
-		panic(err)
-	}
+	ipCache := freecache.NewCache(256 * 1024 * 1024)
 
 	l := &limiter{
 		cfg:     cfg,
@@ -103,7 +99,7 @@ func (l *limiter) allowIP(key string) bool {
 	if v, ok := l.ipLimiters.Load(key); ok {
 		il := v.(*ipLimiter)
 		il.lastSeen = now
-		_ = l.ipCache.Set(key, []byte("1"))
+		_ = l.ipCache.Set([]byte(key), []byte("1"), int(l.cfg.TTL.Seconds()))
 		return il.limiter.Allow()
 	}
 
@@ -112,7 +108,7 @@ func (l *limiter) allowIP(key string) bool {
 		lastSeen: now,
 	}
 	l.ipLimiters.Store(key, il)
-	_ = l.ipCache.Set(key, []byte("1"))
+	_ = l.ipCache.Set([]byte(key), []byte("1"), int(l.cfg.TTL.Seconds()))
 	return il.limiter.Allow()
 }
 
@@ -125,7 +121,7 @@ func (l *limiter) cleanupExpired() {
 			il := value.(*ipLimiter)
 			if time.Since(il.lastSeen) > l.cfg.TTL {
 				l.ipLimiters.Delete(key)
-				_ = l.ipCache.Delete(key.(string))
+				_ = l.ipCache.Del([]byte(key.(string)))
 			}
 			return true
 		})

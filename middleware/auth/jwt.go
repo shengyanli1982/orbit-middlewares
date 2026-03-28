@@ -15,6 +15,17 @@ type JWTAuthConfig struct {
 }
 
 func JWTAuth(cfg JWTAuthConfig) gin.HandlerFunc {
+	keyFunc := cfg.KeyFunc
+	if keyFunc == nil {
+		secret := cfg.Secret
+		keyFunc = func(token *jwt.Token) (any, error) {
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, jwt.ErrSignatureInvalid
+			}
+			return secret, nil
+		}
+	}
+
 	return func(c *gin.Context) {
 		if cfg.Skipper != nil && cfg.Skipper(c) {
 			c.Next()
@@ -35,21 +46,7 @@ func JWTAuth(cfg JWTAuthConfig) gin.HandlerFunc {
 			return
 		}
 
-		tokenString := parts[1]
-
-		var keyFunc jwt.Keyfunc
-		if cfg.KeyFunc != nil {
-			keyFunc = cfg.KeyFunc
-		} else {
-			keyFunc = func(token *jwt.Token) (any, error) {
-				if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-					return nil, jwt.ErrSignatureInvalid
-				}
-				return cfg.Secret, nil
-			}
-		}
-
-		token, err := jwt.Parse(tokenString, keyFunc)
+		token, err := jwt.Parse(parts[1], keyFunc)
 		if err != nil {
 			c.String(http.StatusUnauthorized, "[401] unauthorized, reason: invalid token")
 			c.Abort()
