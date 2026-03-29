@@ -255,3 +255,120 @@ func TestCompression_CompressionLevel(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, "gzip", w.Header().Get("Content-Encoding"))
 }
+
+func TestCompression_ZstdAlgorithm(t *testing.T) {
+	r := gin.New()
+	r.Use(New(Config{
+		Algorithm: AlgorithmZstd,
+		MinLength: 1,
+	}))
+	r.GET("/test", func(c *gin.Context) {
+		c.String(http.StatusOK, "Hello, World!")
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Accept-Encoding", "gzip, deflate, zstd")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "zstd", w.Header().Get("Content-Encoding"))
+	assert.NotEmpty(t, w.Header().Get("Vary"))
+}
+
+func TestCompression_BrotliAlgorithm(t *testing.T) {
+	r := gin.New()
+	r.Use(New(Config{
+		Algorithm: AlgorithmBrotli,
+		MinLength: 1,
+	}))
+	r.GET("/test", func(c *gin.Context) {
+		c.String(http.StatusOK, "Hello, World!")
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "br", w.Header().Get("Content-Encoding"))
+	assert.NotEmpty(t, w.Header().Get("Vary"))
+}
+
+func TestCompression_AcceptEncodingQValues(t *testing.T) {
+	r := gin.New()
+	r.Use(New(Config{
+		Algorithm: AlgorithmBrotli,
+		MinLength: 1,
+	}))
+	r.GET("/test", func(c *gin.Context) {
+		c.String(http.StatusOK, "Hello, World!")
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Accept-Encoding", "gzip;q=0.5, br;q=1.0, zstd;q=0.8")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "br", w.Header().Get("Content-Encoding"))
+}
+
+func TestCompression_AcceptEncodingGzipPrefersHigherQ(t *testing.T) {
+	r := gin.New()
+	r.Use(New(Config{
+		Algorithm: AlgorithmGzip,
+		MinLength: 1,
+	}))
+	r.GET("/test", func(c *gin.Context) {
+		c.String(http.StatusOK, "Hello, World!")
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Accept-Encoding", "gzip;q=0.5, br;q=1.0")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "gzip", w.Header().Get("Content-Encoding"))
+}
+
+func TestCompression_ContentLengthAfterCompression(t *testing.T) {
+	r := gin.New()
+	r.Use(New(Config{
+		Algorithm: AlgorithmGzip,
+		MinLength: 1,
+	}))
+	r.GET("/test", func(c *gin.Context) {
+		c.String(http.StatusOK, "This is a test response that should be compressed")
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "gzip", w.Header().Get("Content-Encoding"))
+	assert.NotEmpty(t, w.Header().Get("Content-Length"))
+}
+
+func TestCompression_NoCompressionWhenNoMatch(t *testing.T) {
+	r := gin.New()
+	r.Use(New(Config{
+		Algorithm: AlgorithmZstd,
+		MinLength: 1,
+	}))
+	r.GET("/test", func(c *gin.Context) {
+		c.String(http.StatusOK, "Hello, World!")
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Empty(t, w.Header().Get("Content-Encoding"))
+}
