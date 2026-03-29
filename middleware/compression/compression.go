@@ -29,12 +29,13 @@ type Config struct {
 
 type gzipWriter struct {
 	gin.ResponseWriter
-	writer         *gzip.Writer
-	statusWritten  bool
-	status         int
-	minLength      int
-	shouldCompress bool
-	written        int64
+	writer            *gzip.Writer
+	statusWritten     bool
+	status            int
+	minLength         int
+	shouldCompress    bool
+	written           int64
+	contentLenChecked bool
 }
 
 var gzipPool = sync.Pool{
@@ -80,6 +81,7 @@ func New(cfg Config) gin.HandlerFunc {
 		gz.shouldCompress = false
 		gz.statusWritten = false
 		gz.status = http.StatusOK
+		gz.contentLenChecked = false
 
 		c.Writer = gz
 
@@ -142,15 +144,18 @@ func (g *gzipWriter) Write(data []byte) (int, error) {
 
 	g.written += int64(len(data))
 
-	if contentLen := g.Header().Get("Content-Length"); contentLen != "" {
-		if n, err := strconv.Atoi(contentLen); err == nil {
-			if n < g.minLength {
-				g.shouldCompress = false
-				g.Header().Del("Content-Encoding")
-				return g.ResponseWriter.Write(data)
+	if !g.contentLenChecked {
+		g.contentLenChecked = true
+		if contentLen := g.Header().Get("Content-Length"); contentLen != "" {
+			if n, err := strconv.Atoi(contentLen); err == nil {
+				if n < g.minLength {
+					g.shouldCompress = false
+					g.Header().Del("Content-Encoding")
+					return g.ResponseWriter.Write(data)
+				}
+				g.shouldCompress = true
+				g.Header().Del("Content-Length")
 			}
-			g.shouldCompress = true
-			g.Header().Del("Content-Length")
 		}
 	}
 
