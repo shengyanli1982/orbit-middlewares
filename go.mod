@@ -1,6 +1,8 @@
 module github.com/shengyanli1982/orbit-middlewares
 
-go 1.21
+go 1.24
+
+toolchain go1.24.13
 
 require (
 	github.com/gin-gonic/gin v1.10.1
