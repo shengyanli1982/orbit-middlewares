@@ -1,28 +1,22 @@
 package compression
 
 import (
+	"compress/gzip"
 	"io"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/gin-gonic/gin"
 )
 
-type Algorithm string
-
 const (
-	AlgorithmGzip   Algorithm = "gzip"
-	AlgorithmZstd   Algorithm = "zstd"
-	AlgorithmBrotli Algorithm = "brotli"
-)
-
-const (
-	BestCompression    = 9
-	BestSpeed          = 1
-	DefaultCompression = 5
-	NoCompression      = 0
+	BestCompression    = gzip.BestCompression
+	BestSpeed          = gzip.BestSpeed
+	DefaultCompression = gzip.DefaultCompression
+	NoCompression      = gzip.NoCompression
 )
 
 type Config struct {
@@ -30,26 +24,24 @@ type Config struct {
 	ExcludedPaths    []string
 	ExcludedExts     []string
 	MinLength        int
-	Algorithm        Algorithm
 	CompressionLevel int
 }
 
-type CompressorWriter interface {
-	Write([]byte) (int, error)
-	Close() error
-	Reset(io.Writer)
-	Flush() error
-	CompressedSize() int64
-}
-
-type responseWriter struct {
+type gzipWriter struct {
 	gin.ResponseWriter
-	compressor     CompressorWriter
+	writer         *gzip.Writer
 	statusWritten  bool
 	status         int
 	minLength      int
 	shouldCompress bool
 	written        int64
+}
+
+var gzipPool = sync.Pool{
+	New: func() interface{} {
+		gz, _ := gzip.NewWriterLevel(io.Discard, DefaultCompression)
+		return &gzipWriter{writer: gz}
+	},
 }
 
 func New(cfg Config) gin.HandlerFunc {
@@ -63,11 +55,6 @@ func New(cfg Config) gin.HandlerFunc {
 		level = DefaultCompression
 	}
 
-	algorithm := cfg.Algorithm
-	if algorithm == "" {
-		algorithm = AlgorithmGzip
-	}
-
 	excludedPaths := newExcludedPaths(cfg.ExcludedPaths)
 	excludedExts := newExcludedExtensions(cfg.ExcludedExts)
 
@@ -77,36 +64,26 @@ func New(cfg Config) gin.HandlerFunc {
 			return
 		}
 
-		encoding := negotiateEncoding(c.Request, algorithm)
-		if encoding == "" {
+		if !shouldCompress(c.Request, excludedPaths, excludedExts) {
 			c.Next()
 			return
 		}
 
-		if excludedPaths.Contains(c.Request.URL.Path) || excludedExts.Contains(filepath.Ext(c.Request.URL.Path)) {
-			c.Next()
-			return
+		gz := gzipPool.Get().(*gzipWriter)
+		gz.ResponseWriter = c.Writer
+		gz.writer.Reset(c.Writer)
+		if level != DefaultCompression {
+			gz.writer, _ = gzip.NewWriterLevel(c.Writer, level)
 		}
+		gz.minLength = minLength
+		gz.written = 0
+		gz.shouldCompress = false
+		gz.statusWritten = false
+		gz.status = http.StatusOK
 
-		var compressor CompressorWriter
-		switch encoding {
-		case "zstd":
-			compressor = getZstdWriter(level)
-		case "br":
-			compressor = getBrotliWriter(level)
-		default:
-			compressor = getGzipWriter(level)
-		}
-		compressor.Reset(c.Writer)
+		c.Writer = gz
 
-		rw := &responseWriter{
-			ResponseWriter: c.Writer,
-			compressor:     compressor,
-			minLength:      minLength,
-		}
-		c.Writer = rw
-
-		c.Header("Content-Encoding", encoding)
+		c.Header("Content-Encoding", "gzip")
 		c.Writer.Header().Add("Vary", "Accept-Encoding")
 
 		c.Next()
@@ -115,162 +92,111 @@ func New(cfg Config) gin.HandlerFunc {
 			c.Writer.Header().Set("ETag", "W/"+etag)
 		}
 
-		finalSize := rw.compressor.CompressedSize()
-
 		switch {
-		case rw.status >= http.StatusBadRequest:
+		case gz.status >= http.StatusBadRequest:
 			c.Writer.Header().Del("Content-Encoding")
 			c.Writer.Header().Del("Vary")
-			rw.compressor.Reset(io.Discard)
-		case !rw.shouldCompress:
+		case !gz.shouldCompress:
 			c.Writer.Header().Del("Content-Encoding")
 			c.Writer.Header().Del("Vary")
-			rw.compressor.Reset(io.Discard)
-		case rw.written == 0:
-			rw.compressor.Reset(io.Discard)
+		case gz.written > 0:
+			c.Writer.Header().Set("Content-Length", strconv.Itoa(int(gz.written)))
 		}
 
-		_ = rw.compressor.Close()
-		putCompressor(encoding, compressor)
-
-		if rw.shouldCompress && finalSize > 0 {
-			c.Writer.Header().Set("Content-Length", formatInt(int(finalSize)))
-		}
+		_ = gz.writer.Close()
+		gz.writer.Reset(io.Discard)
+		gz.ResponseWriter = nil
+		gzipPool.Put(gz)
 	}
 }
 
-func (rw *responseWriter) Write(data []byte) (int, error) {
-	if !rw.statusWritten {
-		rw.status = rw.ResponseWriter.Status()
-	}
-
-	if rw.status >= http.StatusBadRequest {
-		return rw.ResponseWriter.Write(data)
-	}
-
-	if len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b {
-		rw.shouldCompress = false
-		return rw.ResponseWriter.Write(data)
-	}
-
-	rw.written += int64(len(data))
-
-	if rw.Header().Get("Content-Length") != "" {
-		if contentLen, err := parseInt(rw.Header().Get("Content-Length")); err == nil {
-			if contentLen < rw.minLength {
-				rw.shouldCompress = false
-				rw.Header().Del("Content-Encoding")
-				return rw.ResponseWriter.Write(data)
-			}
-			rw.shouldCompress = true
-			rw.Header().Del("Content-Length")
-		}
-	}
-
-	if !rw.shouldCompress && int64(len(data)) >= int64(rw.minLength) {
-		rw.shouldCompress = true
-	} else if !rw.shouldCompress {
-		rw.Header().Del("Content-Encoding")
-		return rw.ResponseWriter.Write(data)
-	}
-
-	n, err := rw.compressor.Write(data)
-	return n, err
-}
-
-func (rw *responseWriter) WriteString(s string) (int, error) {
-	return rw.Write([]byte(s))
-}
-
-func (rw *responseWriter) Status() int {
-	if rw.statusWritten {
-		return rw.status
-	}
-	return rw.ResponseWriter.Status()
-}
-
-func (rw *responseWriter) Size() int {
-	return int(rw.written)
-}
-
-func (rw *responseWriter) Written() bool {
-	return rw.ResponseWriter.Written()
-}
-
-func (rw *responseWriter) WriteHeaderNow() {
-	rw.ResponseWriter.WriteHeaderNow()
-}
-
-func (rw *responseWriter) WriteHeader(code int) {
-	rw.status = code
-	rw.statusWritten = true
-	rw.ResponseWriter.WriteHeader(code)
-}
-
-func (rw *responseWriter) Flush() {
-	rw.compressor.Flush()
-	rw.ResponseWriter.Flush()
-}
-
-func negotiateEncoding(req *http.Request, preferred Algorithm) string {
-	acceptEncoding := req.Header.Get("Accept-Encoding")
-	if acceptEncoding == "" {
-		return ""
+func shouldCompress(req *http.Request, paths excludedPaths, exts excludedExtensions) bool {
+	if !strings.Contains(req.Header.Get("Accept-Encoding"), "gzip") {
+		return false
 	}
 
 	if strings.Contains(req.Header.Get("Connection"), "Upgrade") {
-		return ""
+		return false
 	}
 
-	supported := parseAcceptEncoding(acceptEncoding)
-
-	switch preferred {
-	case AlgorithmZstd:
-		if q, ok := supported["zstd"]; ok && q > 0 {
-			return "zstd"
-		}
-		return ""
-	case AlgorithmBrotli:
-		if q, ok := supported["br"]; ok && q > 0 {
-			return "br"
-		}
-		return ""
-	default:
-		if q, ok := supported["gzip"]; ok && q > 0 {
-			return "gzip"
-		}
-		if q, ok := supported["br"]; ok && q > 0 {
-			return "br"
-		}
-		if q, ok := supported["zstd"]; ok && q > 0 {
-			return "zstd"
-		}
-		return ""
+	if paths.Contains(req.URL.Path) || exts.Contains(filepath.Ext(req.URL.Path)) {
+		return false
 	}
+
+	return true
 }
 
-func parseAcceptEncoding(header string) map[string]float64 {
-	result := make(map[string]float64)
-	parts := strings.Split(header, ",")
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		encoding := part
-		qvalue := 1.0
-		if idx := strings.Index(part, ";"); idx != -1 {
-			encoding = strings.TrimSpace(part[:idx])
-			qpart := strings.TrimSpace(part[idx+1:])
-			if strings.HasPrefix(qpart, "q=") {
-				if q, err := parseFloat(strings.TrimPrefix(qpart, "q=")); err == nil {
-					qvalue = q
-				}
-			}
-		}
-		result[encoding] = qvalue
+func (g *gzipWriter) Write(data []byte) (int, error) {
+	if !g.statusWritten {
+		g.status = g.ResponseWriter.Status()
 	}
-	return result
+
+	if g.status >= http.StatusBadRequest {
+		return g.ResponseWriter.Write(data)
+	}
+
+	if len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+		g.shouldCompress = false
+		return g.ResponseWriter.Write(data)
+	}
+
+	g.written += int64(len(data))
+
+	if contentLen := g.Header().Get("Content-Length"); contentLen != "" {
+		if n, err := strconv.Atoi(contentLen); err == nil {
+			if n < g.minLength {
+				g.shouldCompress = false
+				g.Header().Del("Content-Encoding")
+				return g.ResponseWriter.Write(data)
+			}
+			g.shouldCompress = true
+			g.Header().Del("Content-Length")
+		}
+	}
+
+	if !g.shouldCompress && int64(len(data)) >= int64(g.minLength) {
+		g.shouldCompress = true
+	} else if !g.shouldCompress {
+		g.Header().Del("Content-Encoding")
+		return g.ResponseWriter.Write(data)
+	}
+
+	n, err := g.writer.Write(data)
+	return n, err
+}
+
+func (g *gzipWriter) WriteString(s string) (int, error) {
+	return g.Write([]byte(s))
+}
+
+func (g *gzipWriter) Status() int {
+	if g.statusWritten {
+		return g.status
+	}
+	return g.ResponseWriter.Status()
+}
+
+func (g *gzipWriter) Size() int {
+	return int(g.written)
+}
+
+func (g *gzipWriter) Written() bool {
+	return g.ResponseWriter.Written()
+}
+
+func (g *gzipWriter) WriteHeaderNow() {
+	g.ResponseWriter.WriteHeaderNow()
+}
+
+func (g *gzipWriter) WriteHeader(code int) {
+	g.status = code
+	g.statusWritten = true
+	g.ResponseWriter.WriteHeader(code)
+}
+
+func (g *gzipWriter) Flush() {
+	_ = g.writer.Flush()
+	g.ResponseWriter.Flush()
 }
 
 type excludedPaths []string
@@ -301,120 +227,4 @@ func newExcludedExtensions(exts []string) excludedExtensions {
 func (e excludedExtensions) Contains(ext string) bool {
 	_, ok := e[ext]
 	return ok
-}
-
-func parseInt(s string) (int, error) {
-	var n int
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return 0, nil
-		}
-		n = n*10 + int(c-'0')
-	}
-	return n, nil
-}
-
-func parseFloat(s string) (float64, error) {
-	var n float64
-	var decimal float64 = 1
-	seenDot := false
-	negative := false
-	for _, c := range s {
-		if c == '-' {
-			negative = true
-			continue
-		}
-		if c == '.' {
-			seenDot = true
-			continue
-		}
-		if c < '0' || c > '9' {
-			continue
-		}
-		if seenDot {
-			decimal /= 10
-			n += float64(c-'0') * decimal
-		} else {
-			n = n*10 + float64(c-'0')
-		}
-	}
-	if negative {
-		n = -n
-	}
-	return n, nil
-}
-
-func formatInt(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var result []byte
-	negative := n < 0
-	if negative {
-		n = -n
-	}
-	for n > 0 {
-		result = append([]byte{byte('0' + n%10)}, result...)
-		n /= 10
-	}
-	if negative {
-		result = append([]byte{'-'}, result...)
-	}
-	return string(result)
-}
-
-var (
-	gzipPool   sync.Pool
-	zstdPool   sync.Pool
-	brotliPool sync.Pool
-)
-
-func getGzipWriter(level int) *gzipWriter {
-	gz := gzipPool.Get().(*gzipWriter)
-	gz.ResetLevel(level)
-	return gz
-}
-
-func putGzipWriter(gz *gzipWriter) {
-	gz.Reset(io.Discard)
-	gzipPool.Put(gz)
-}
-
-func getZstdWriter(level int) *zstdWriter {
-	z := zstdPool.Get().(*zstdWriter)
-	z.ResetLevel(level)
-	return z
-}
-
-func putZstdWriter(z *zstdWriter) {
-	z.Reset(io.Discard)
-	zstdPool.Put(z)
-}
-
-func getBrotliWriter(level int) *brotliWriter {
-	b := brotliPool.Get().(*brotliWriter)
-	b.ResetLevel(level)
-	return b
-}
-
-func putBrotliWriter(b *brotliWriter) {
-	b.Reset(io.Discard)
-	brotliPool.Put(b)
-}
-
-func putCompressor(encoding string, c CompressorWriter) {
-	switch encoding {
-	case "zstd":
-		if z, ok := c.(*zstdWriter); ok {
-			putZstdWriter(z)
-		}
-	case "br":
-		if b, ok := c.(*brotliWriter); ok {
-			putBrotliWriter(b)
-		}
-	default:
-		if g, ok := c.(*gzipWriter); ok {
-			putGzipWriter(g)
-		}
-	}
 }
