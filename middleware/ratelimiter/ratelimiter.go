@@ -136,29 +136,26 @@ func StringToBytes(s string) []byte {
 
 //go:inline
 func extractLastOctet(ipStr string) int {
-	b := StringToBytes(ipStr)
-	n := len(b)
+	n := len(ipStr)
 	if n == 0 {
 		return 0
 	}
 
 	p := n - 1
-	for p >= 0 && b[p] != '.' {
+	for p >= 0 && ipStr[p] != '.' {
 		p--
 	}
-	if p < 0 {
+	if p < 0 || p+1 >= n {
 		return 0
 	}
-	p++
 
 	result := 0
-	for p < n {
-		c := b[p]
+	for p = p + 1; p < n; p++ {
+		c := ipStr[p]
 		if c < '0' || c > '9' {
 			break
 		}
 		result = result*10 + int(c-'0')
-		p++
 	}
 	return result
 }
@@ -208,10 +205,12 @@ func (l *limiter) cleanupExpired() {
 		case <-l.stopCh:
 			return
 		case <-ticker.C:
+			now := time.Now()
+			ttl := l.cfg.TTL
 			for i := range l.shards {
 				l.shards[i].Range(func(key, value any) bool {
 					il := value.(*ipLimiter)
-					if time.Since(il.lastSeen) > l.cfg.TTL {
+					if now.Sub(il.lastSeen) > ttl {
 						l.shards[i].Delete(key)
 					}
 					return true

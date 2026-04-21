@@ -13,7 +13,7 @@ func TestRequestID(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 
-	router.Use(RequestID())
+	router.Use(New(Config{}))
 	router.GET("/test", func(c *gin.Context) {
 		requestID := c.GetString("request_id")
 		c.String(http.StatusOK, requestID)
@@ -32,7 +32,7 @@ func TestRequestID_HeaderExists(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 
-	router.Use(RequestID())
+	router.Use(New(Config{}))
 	router.GET("/test", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
@@ -48,7 +48,7 @@ func TestRequestID_CustomHeader(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 
-	router.Use(RequestID(WithHeaderName("X-Custom-ID")))
+	router.Use(New(Config{HeaderName: "X-Custom-ID"}))
 	router.GET("/test", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
@@ -64,9 +64,11 @@ func TestRequestID_Skipper(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 
-	router.Use(RequestID(WithSkipper(func(c *gin.Context) bool {
-		return c.Request.URL.Path == "/skip"
-	})))
+	router.Use(New(Config{
+		Skipper: func(c *gin.Context) bool {
+			return c.Request.URL.Path == "/skip"
+		},
+	}))
 	router.GET("/skip", func(c *gin.Context) {
 		_, exists := c.Get("request_id")
 		assert.False(t, exists)

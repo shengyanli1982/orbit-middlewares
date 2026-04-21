@@ -1,9 +1,7 @@
-
-
 # Orbit Middlewares
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/shengyanli1982/orbit-middlewares)](https://goreportcard.com/report/github.com/shengyanli1982/orbit-middlewares)
-[![Build Status](https://github.com/shengyanli1982/orbit-middlewares/actions/workflows/test.yaml/badge.svg)](https://github.com/shengyanli1982/orbit-middlewares/actions)
+[![Build Status](https://github.com/shengyanli1982/orbit-middlewares/actions/workflows/test.yaml/badge.svg)](https://github.com/shengyanli1982/orbit-middlewares)
 [![Go Reference](https://pkg.go.dev/badge/github.com/shengyanli1982/orbit-middlewares.svg)](https://pkg.go.dev/github.com/shengyanli1982/orbit-middlewares)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/shengyanli1982/orbit-middlewares)
 
@@ -21,15 +19,17 @@ You can compose these middlewares in any combination to build secure, observable
 
 ## Middleware Portfolio
 
-| Middleware    | Best for             | Key capability                                        |
-| ------------- | -------------------- | ----------------------------------------------------- |
-| `IPFilter`    | Access control       | IP whitelist/blacklist with O(1) lookup               |
-| `JWTAuth`     | Token authentication | HMAC signature validation with custom KeyFunc support |
-| `APIKeyAuth`  | API key validation   | Multi-key support with custom Validator function      |
-| `RateLimiter` | Request throttling   | Token bucket algorithm, global or per-IP mode         |
-| `RequestID`   | Request tracing      | ID propagation or generation with crypto/rand         |
-| `RequestSize` | Payload protection   | Body size limit before reading                        |
-| `Timeout`     | Deadline control     | Context-based timeout with proper cancellation        |
+| Middleware    | Best for             | Key capability                                              |
+| ------------- | -------------------- | ----------------------------------------------------------- |
+| `IPFilter`    | Access control       | IP whitelist/blacklist with O(1) lookup                     |
+| `JWTAuth`     | Token authentication | HMAC signature validation with custom KeyFunc support       |
+| `APIKeyAuth`  | API key validation   | Multi-key support with custom Validator function            |
+| `RateLimiter` | Request throttling   | Token bucket algorithm, global or per-IP mode               |
+| `RequestID`   | Request tracing      | ID propagation or generation with crypto/rand               |
+| `RequestSize` | Payload protection   | Body size limit before reading                              |
+| `Timeout`     | Deadline control     | Context-based timeout with proper cancellation              |
+| `Compression` | Response compression | GZIP compression with configurable level and excluded paths |
+| `Security`    | Security hardening   | HTTP security headers (CSP, HSTS, X-Frame-Options, etc.)    |
 
 ## Quick Start
 
@@ -41,17 +41,18 @@ go get github.com/shengyanli1982/orbit-middlewares
 package main
 
 import (
-	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/shengyanli1982/orbit"
 	"github.com/shengyanli1982/orbit-middlewares/middleware/auth"
+	"github.com/shengyanli1982/orbit-middlewares/middleware/compression"
 	"github.com/shengyanli1982/orbit-middlewares/middleware/ipfilter"
 	"github.com/shengyanli1982/orbit-middlewares/middleware/ratelimiter"
 	"github.com/shengyanli1982/orbit-middlewares/middleware/requestid"
 	"github.com/shengyanli1982/orbit-middlewares/middleware/requestsize"
+	"github.com/shengyanli1982/orbit-middlewares/middleware/security"
 	"github.com/shengyanli1982/orbit-middlewares/middleware/timeout"
 )
 
@@ -72,7 +73,11 @@ func main() {
 	opts := orbit.NewOptions()
 	engine := orbit.NewEngine(config, opts)
 
-	engine.RegisterMiddleware(requestid.RequestID())
+	engine.RegisterMiddleware(requestid.New(requestid.Config{}))
+	engine.RegisterMiddleware(security.New(security.DefaultConfig()))
+	engine.RegisterMiddleware(compression.New(compression.Config{
+		MinLength: 1024,
+	}))
 	engine.RegisterMiddleware(ipfilter.New(ipfilter.Config{
 		BlockedIPs: []string{"192.168.1.100"},
 	}))
@@ -170,9 +175,9 @@ engine.RegisterMiddleware(ratelimiter.New(ratelimiter.Config{
 Request tracing ID generation and propagation.
 
 ```go
-engine.RegisterMiddleware(requestid.RequestID(
-    requestid.WithHeaderName("X-Request-ID"),
-))
+engine.RegisterMiddleware(requestid.New(requestid.Config{
+    HeaderName: "X-Request-ID",
+}))
 ```
 
 - Reuses client-provided ID if present
@@ -203,6 +208,55 @@ engine.RegisterMiddleware(timeout.New(timeout.Config{
 
 - Returns `504 Gateway Timeout` if timeout exceeded
 
+### Compression
+
+HTTP response compression using gzip.
+
+```go
+engine.RegisterMiddleware(compression.New(compression.Config{
+    MinLength:       1024,
+    CompressionLevel: compression.DefaultCompression,
+}))
+```
+
+- Supports gzip compression with configurable level
+- Adds `Content-Encoding: gzip` and `Vary: Accept-Encoding` headers
+- Skips compression for error responses (4xx, 5xx)
+- Excludes specified paths and file extensions
+
+### Security
+
+HTTP security headers for production applications.
+
+```go
+engine.RegisterMiddleware(security.New(security.DefaultConfig()))
+```
+
+Available presets:
+
+- `DefaultConfig()`: Production-safe defaults
+- `StrictConfig()`: Higher security requirements
+- `LaxConfig()`: Development/testing
+
+```go
+engine.RegisterMiddleware(security.New(security.Config{
+    XFrameOptions:       "DENY",
+    XContentTypeOptions: "nosniff",
+    HSTSMaxAge:          31536000,
+    CSP:                 "default-src 'self'",
+}))
+```
+
+Sets the following headers:
+
+- `X-Frame-Options`: Clickjacking protection (DENY/SAMEORIGIN)
+- `X-Content-Type-Options`: MIME-sniffing prevention (nosniff)
+- `Strict-Transport-Security`: HTTPS enforcement (HSTS)
+- `Content-Security-Policy`: XSS and injection protection
+- `X-XSS-Protection`: Legacy XSS filter compatibility
+- `Referrer-Policy`: Referrer information control
+- `Permissions-Policy`: Browser feature restrictions
+
 ## Example Projects
 
 Runnable demos:
@@ -215,6 +269,8 @@ Runnable demos:
 - [`examples/apikey_example.go`](./examples/apikey_example.go)
 - [`examples/requestsize_example.go`](./examples/requestsize_example.go)
 - [`examples/ipfilter_example.go`](./examples/ipfilter_example.go)
+- [`examples/compression_example.go`](./examples/compression_example.go)
+- [`examples/security_example.go`](./examples/security_example.go)
 - [`examples/combined_example.go`](./examples/combined_example.go)
 
 Run any example directly:
