@@ -2,7 +2,6 @@ package auth
 
 import (
 	"net/http"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -14,14 +13,10 @@ type JWTAuthConfig struct {
 	KeyFunc jwt.Keyfunc
 }
 
-// JWTAuth JWT认证中间件
-// keyfunc在handler外部创建一次，避免每次请求都分配闭包
 func JWTAuth(cfg JWTAuthConfig) gin.HandlerFunc {
 	keyFunc := cfg.KeyFunc
+	secret := cfg.Secret
 	if keyFunc == nil {
-		// 未提供KeyFunc时，创建默认的HMAC验证闭包
-		// secret通过值捕获而非引用，避免闭包捕获指针问题
-		secret := cfg.Secret
 		keyFunc = func(token *jwt.Token) (any, error) {
 			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 				return nil, jwt.ErrSignatureInvalid
@@ -30,43 +25,36 @@ func JWTAuth(cfg JWTAuthConfig) gin.HandlerFunc {
 		}
 	}
 
+	headerName := "Authorization"
 	return func(c *gin.Context) {
 		if cfg.Skipper != nil && cfg.Skipper(c) {
 			c.Next()
 			return
 		}
 
-		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" {
+		authHeader := c.GetHeader(headerName)
+		if len(authHeader) < 8 {
 			c.String(http.StatusUnauthorized, "[401] unauthorized, reason: missing token")
 			c.Abort()
 			return
 		}
 
-		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
-			c.String(http.StatusUnauthorized, "[401] unauthorized, reason: invalid token format")
-			c.Abort()
-			return
+		authHeaderLen := len(authHeader)
+		if authHeaderLen > 7 && authHeader[0] == 'B' && authHeader[1] == 'e' && authHeader[2] == 'a' && authHeader[3] == 'r' && authHeader[4] == 'e' && authHeader[5] == 'r' && authHeader[6] == ' ' {
+			tokenStr := authHeader[7:]
+			if len(tokenStr) > 0 {
+				token, err := jwt.Parse(tokenStr, keyFunc)
+				if err == nil && token.Valid {
+					if claims, ok := token.Claims.(jwt.MapClaims); ok {
+						c.Set("jwt_claims", claims)
+					}
+					c.Next()
+					return
+				}
+			}
 		}
-
-		token, err := jwt.Parse(parts[1], keyFunc)
-		if err != nil {
-			c.String(http.StatusUnauthorized, "[401] unauthorized, reason: invalid token")
-			c.Abort()
-			return
-		}
-
-		if !token.Valid {
-			c.String(http.StatusUnauthorized, "[401] unauthorized, reason: invalid token")
-			c.Abort()
-			return
-		}
-
-		if claims, ok := token.Claims.(jwt.MapClaims); ok {
-			c.Set("jwt_claims", claims)
-		}
-
-		c.Next()
+		c.String(http.StatusUnauthorized, "[401] unauthorized, reason: invalid token")
+		c.Abort()
+		return
 	}
 }

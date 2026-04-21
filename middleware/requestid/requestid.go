@@ -3,27 +3,22 @@ package requestid
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"sync/atomic"
 
 	"github.com/gin-gonic/gin"
 )
 
+var pool []byte
+var poolIdx uint32
+
+func init() {
+	pool = make([]byte, 4096)
+	rand.Read(pool)
+}
+
 type Config struct {
 	Skipper    func(*gin.Context) bool
 	HeaderName string
-}
-
-type Option func(*Config)
-
-func WithHeaderName(name string) Option {
-	return func(c *Config) {
-		c.HeaderName = name
-	}
-}
-
-func WithSkipper(fn func(*gin.Context) bool) Option {
-	return func(c *Config) {
-		c.Skipper = fn
-	}
 }
 
 func New(cfg Config) gin.HandlerFunc {
@@ -40,7 +35,13 @@ func New(cfg Config) gin.HandlerFunc {
 
 		requestID := c.GetHeader(headerName)
 		if requestID == "" {
-			requestID = generateID()
+			idx := atomic.AddUint32(&poolIdx, 16)
+			if idx+16 > uint32(len(pool)) {
+				rand.Read(pool)
+				atomic.StoreUint32(&poolIdx, 0)
+				idx = 0
+			}
+			requestID = hex.EncodeToString(pool[idx : idx+16])
 		}
 
 		c.Set("request_id", requestID)
@@ -48,21 +49,4 @@ func New(cfg Config) gin.HandlerFunc {
 
 		c.Next()
 	}
-}
-
-func RequestID(opts ...Option) gin.HandlerFunc {
-	cfg := Config{}
-	for _, opt := range opts {
-		opt(&cfg)
-	}
-	return New(cfg)
-}
-
-// generateID 生成一个16字节的随机ID，使用hex编码
-// 使用 crypto/rand 确保密码学安全的随机数
-// hex.EncodeToString 比 fmt.Sprintf 更高效，减少内存分配
-func generateID() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
 }

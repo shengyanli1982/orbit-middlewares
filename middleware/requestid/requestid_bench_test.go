@@ -103,18 +103,3 @@ func BenchmarkRequestID_MemAllocation(b *testing.B) {
 	runtime.GC()
 	pprof.WriteHeapProfile(f)
 }
-
-func BenchmarkGenerateID(b *testing.B) {
-	f, err := os.Create("requestid_genid_cpu.prof")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer f.Close()
-	pprof.StartCPUProfile(f)
-	defer pprof.StopCPUProfile()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		generateID()
-	}
-}
