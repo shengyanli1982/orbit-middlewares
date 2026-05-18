@@ -1,6 +1,7 @@
 package security
 
 import (
+	"net/textproto"
 	"strconv"
 	"strings"
 
@@ -21,28 +22,33 @@ type Config struct {
 	PermissionsPolicy     string
 }
 
+// headerEntry 存储预计算的 canonical key 与对应值，避免每次请求重复规范化。
+type headerEntry struct {
+	key   string // textproto.CanonicalMIMEHeaderKey 预计算结果
+	value string
+}
+
 type securityHeaders struct {
-	skipper             func(*gin.Context) bool
-	xFrameOptions       string
-	xContentTypeOptions string
-	hstsHeader          string
-	csp                 string
-	xssProtection       string
-	referrerPolicy      string
-	permissionsPolicy   string
+	skipper func(*gin.Context) bool
+	// headers 仅包含值非空的条目，handler 直接遍历写入，无需逐字段判断。
+	headers []headerEntry
 }
 
 func New(cfg Config) gin.HandlerFunc {
-	h := &securityHeaders{
-		skipper:             cfg.Skipper,
-		xFrameOptions:       cfg.XFrameOptions,
-		xContentTypeOptions: cfg.XContentTypeOptions,
-		csp:                 cfg.CSP,
-		xssProtection:       cfg.XSSProtection,
-		referrerPolicy:      cfg.ReferrerPolicy,
-		permissionsPolicy:   cfg.PermissionsPolicy,
+	// 校验所有 header 值，防止 HTTP Header Injection
+	validateHeaderValue(cfg.XFrameOptions)
+	validateHeaderValue(cfg.XContentTypeOptions)
+	validateHeaderValue(cfg.CSP)
+	validateHeaderValue(cfg.XSSProtection)
+	validateHeaderValue(cfg.ReferrerPolicy)
+	validateHeaderValue(cfg.PermissionsPolicy)
+
+	if cfg.CSP == "" {
+		cfg.CSP = "default-src 'self'"
 	}
 
+	// 预计算 HSTS 值
+	var hstsValue string
 	if cfg.HSTSMaxAge > 0 {
 		var b strings.Builder
 		b.WriteString("max-age=")
@@ -53,11 +59,34 @@ func New(cfg Config) gin.HandlerFunc {
 		if cfg.HSTSPreload {
 			b.WriteString("; preload")
 		}
-		h.hstsHeader = b.String()
+		hstsValue = b.String()
 	}
 
-	if h.csp == "" {
-		h.csp = "default-src 'self'"
+	// 按固定顺序构建非空 header 列表，key 在初始化时规范化一次。
+	type rawEntry struct{ key, value string }
+	candidates := []rawEntry{
+		{"X-Frame-Options", cfg.XFrameOptions},
+		{"X-Content-Type-Options", cfg.XContentTypeOptions},
+		{"Strict-Transport-Security", hstsValue},
+		{"Content-Security-Policy", cfg.CSP},
+		{"X-XSS-Protection", cfg.XSSProtection},
+		{"Referrer-Policy", cfg.ReferrerPolicy},
+		{"Permissions-Policy", cfg.PermissionsPolicy},
+	}
+
+	entries := make([]headerEntry, 0, len(candidates))
+	for _, c := range candidates {
+		if c.value != "" {
+			entries = append(entries, headerEntry{
+				key:   textproto.CanonicalMIMEHeaderKey(c.key),
+				value: c.value,
+			})
+		}
+	}
+
+	h := &securityHeaders{
+		skipper: cfg.Skipper,
+		headers: entries,
 	}
 
 	return h.handle
@@ -69,32 +98,11 @@ func (h *securityHeaders) handle(c *gin.Context) {
 		return
 	}
 
-	if h.xFrameOptions != "" {
-		c.Header("X-Frame-Options", h.xFrameOptions)
-	}
-
-	if h.xContentTypeOptions != "" {
-		c.Header("X-Content-Type-Options", h.xContentTypeOptions)
-	}
-
-	if h.hstsHeader != "" {
-		c.Header("Strict-Transport-Security", h.hstsHeader)
-	}
-
-	if h.csp != "" {
-		c.Header("Content-Security-Policy", h.csp)
-	}
-
-	if h.xssProtection != "" {
-		c.Header("X-XSS-Protection", h.xssProtection)
-	}
-
-	if h.referrerPolicy != "" {
-		c.Header("Referrer-Policy", h.referrerPolicy)
-	}
-
-	if h.permissionsPolicy != "" {
-		c.Header("Permissions-Policy", h.permissionsPolicy)
+	// 直接写底层 http.Header map，key 已预计算为 canonical 形式，
+	// 绕过 gin c.Header() 内部的 textproto.CanonicalMIMEHeaderKey 调用。
+	hdr := c.Writer.Header()
+	for i := range h.headers {
+		hdr[h.headers[i].key] = []string{h.headers[i].value}
 	}
 
 	c.Next()
@@ -133,5 +141,12 @@ func LaxConfig() Config {
 		XContentTypeOptions: "nosniff",
 		CSP:                 "default-src 'self' 'unsafe-inline' 'unsafe-eval'",
 		ReferrerPolicy:      "strict-origin-when-cross-origin",
+	}
+}
+
+// validateHeaderValue 校验 header 值不包含 CR/LF，防止 HTTP Header Injection。
+func validateHeaderValue(v string) {
+	if strings.ContainsAny(v, "\r\n") {
+		panic("security: header value contains invalid characters (CR/LF)")
 	}
 }

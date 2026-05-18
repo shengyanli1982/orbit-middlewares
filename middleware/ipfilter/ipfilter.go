@@ -1,7 +1,9 @@
 package ipfilter
 
 import (
+	"net"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -12,30 +14,60 @@ type Config struct {
 	BlockedIPs []string
 }
 
-// ipFilter IP过滤器，使用map存储实现O(1)查找
-// blockedIPs: 黑名单IP集合
-// allowedIPs: 白名单IP集合（若为空则不启用白名单）
+// ipSet 存储精确 IP（O(1) 查找）和 CIDR 网段列表
+type ipSet struct {
+	exactIPs map[string]struct{}
+	cidrNets []*net.IPNet
+}
+
+func newIPSet(ips []string) *ipSet {
+	s := &ipSet{exactIPs: make(map[string]struct{}, len(ips))}
+	for _, ip := range ips {
+		if strings.Contains(ip, "/") {
+			_, ipNet, err := net.ParseCIDR(ip)
+			if err == nil {
+				s.cidrNets = append(s.cidrNets, ipNet)
+			}
+		} else {
+			s.exactIPs[ip] = struct{}{}
+		}
+	}
+	return s
+}
+
+func (s *ipSet) contains(ip string) bool {
+	if _, ok := s.exactIPs[ip]; ok {
+		return true
+	}
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	for _, cidr := range s.cidrNets {
+		if cidr.Contains(parsed) {
+			return true
+		}
+	}
+	return false
+}
+
+// ipFilter IP过滤器
+// blockedIPs: 黑名单（精确 IP + CIDR）
+// allowedIPs: 白名单（精确 IP + CIDR，若为空则不启用白名单）
 // hasAllowed: 标记是否启用了白名单模式
 type ipFilter struct {
 	skipper    func(*gin.Context) bool
-	blockedIPs map[string]struct{}
-	allowedIPs map[string]struct{}
+	blockedIPs *ipSet
+	allowedIPs *ipSet
 	hasAllowed bool
 }
 
 func New(cfg Config) gin.HandlerFunc {
 	f := &ipFilter{
 		skipper:    cfg.Skipper,
-		blockedIPs: make(map[string]struct{}, len(cfg.BlockedIPs)),
-		allowedIPs: make(map[string]struct{}, len(cfg.AllowedIPs)),
+		blockedIPs: newIPSet(cfg.BlockedIPs),
+		allowedIPs: newIPSet(cfg.AllowedIPs),
 		hasAllowed: len(cfg.AllowedIPs) > 0,
-	}
-
-	for _, ip := range cfg.BlockedIPs {
-		f.blockedIPs[ip] = struct{}{}
-	}
-	for _, ip := range cfg.AllowedIPs {
-		f.allowedIPs[ip] = struct{}{}
 	}
 
 	return func(c *gin.Context) {
@@ -46,14 +78,14 @@ func New(cfg Config) gin.HandlerFunc {
 
 		clientIP := c.ClientIP()
 
-		if _, blocked := f.blockedIPs[clientIP]; blocked {
+		if f.blockedIPs.contains(clientIP) {
 			c.String(http.StatusForbidden, "[403] ip blocked")
 			c.Abort()
 			return
 		}
 
 		if f.hasAllowed {
-			if _, allowed := f.allowedIPs[clientIP]; !allowed {
+			if !f.allowedIPs.contains(clientIP) {
 				c.String(http.StatusForbidden, "[403] ip not allowed")
 				c.Abort()
 				return

@@ -3,6 +3,7 @@ package requestid
 import (
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -91,4 +92,38 @@ func TestRequestID_Skipper(t *testing.T) {
 	router.ServeHTTP(recorder2, req2)
 	assert.Equal(t, http.StatusOK, recorder2.Code)
 	assert.NotEmpty(t, recorder2.Header().Get("X-Request-ID"))
+}
+
+// TestRequestID_Concurrent 验证并发生成 request ID 无 data race（-race 检测）。
+func TestRequestID_Concurrent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	router := gin.New()
+	router.Use(New(Config{}))
+	router.GET("/test", func(c *gin.Context) {
+		c.String(http.StatusOK, c.GetString("request_id"))
+	})
+
+	var wg sync.WaitGroup
+	ids := make([]string, 50)
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		idx := i
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodGet, "/test", nil)
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, req)
+			ids[idx] = recorder.Body.String()
+		}()
+	}
+	wg.Wait()
+
+	// 每个请求应生成唯一 ID（32位十六进制）
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		assert.Len(t, id, 32, "request ID 应为 32 位十六进制字符串")
+		assert.False(t, seen[id], "request ID 应唯一，发现重复: %s", id)
+		seen[id] = true
+	}
 }
