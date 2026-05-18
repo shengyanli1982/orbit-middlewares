@@ -23,7 +23,9 @@ func BenchmarkRateLimiter_GlobalMode(b *testing.B) {
 	}
 
 	router := gin.New()
-	router.Use(New(cfg))
+	handler, stop := New(cfg)
+	defer stop()
+	router.Use(handler)
 	router.GET("/test", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
@@ -59,7 +61,9 @@ func BenchmarkRateLimiter_IPMode(b *testing.B) {
 	}
 
 	router := gin.New()
-	router.Use(New(cfg))
+	handler, stop := New(cfg)
+	defer stop()
+	router.Use(handler)
 	router.GET("/test", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
@@ -92,7 +96,9 @@ func BenchmarkRateLimiter_IPModeManyKeys(b *testing.B) {
 	}
 
 	router := gin.New()
-	router.Use(New(cfg))
+	handler, stop := New(cfg)
+	defer stop()
+	router.Use(handler)
 	router.GET("/test", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
@@ -126,7 +132,9 @@ func BenchmarkRateLimiter_MemAllocation(b *testing.B) {
 	}
 
 	router := gin.New()
-	router.Use(New(cfg))
+	handler, stop := New(cfg)
+	defer stop()
+	router.Use(handler)
 	router.GET("/test", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})

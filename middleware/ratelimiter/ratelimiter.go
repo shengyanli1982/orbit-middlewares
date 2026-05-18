@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/time/rate"
@@ -35,7 +35,7 @@ type Config struct {
 
 type ipLimiter struct {
 	limiter  *rate.Limiter
-	lastSeen time.Time
+	lastSeen atomic.Int64 // UnixNano
 }
 
 type limiter struct {
@@ -46,7 +46,9 @@ type limiter struct {
 	stopOnce sync.Once
 }
 
-func New(cfg Config) gin.HandlerFunc {
+// New 创建限流中间件，返回 (handler, stop) 元组。
+// stop 函数用于停止后台清理 goroutine，调用方应在不再需要时调用。
+func New(cfg Config) (gin.HandlerFunc, func()) {
 	if cfg.IPExtractor == nil {
 		cfg.IPExtractor = func(c *gin.Context) string {
 			return c.ClientIP()
@@ -66,7 +68,7 @@ func New(cfg Config) gin.HandlerFunc {
 	// 启动后台清理goroutine
 	go l.cleanupExpired()
 
-	return func(c *gin.Context) {
+	handler := func(c *gin.Context) {
 		if cfg.Skipper != nil && cfg.Skipper(c) {
 			c.Next()
 			return
@@ -107,7 +109,7 @@ func New(cfg Config) gin.HandlerFunc {
 				c.Abort()
 				return
 			}
-			// Reserve Delay() > 0: bucket 中当前没有可用 token，需要等待补充
+			// Reserve Delay() > 0: bucket 中没有可用 token，需要等待补充
 			if delay > 0 {
 				r.Cancel()
 				c.Header("X-RateLimit-Limit", strconv.Itoa(int(math.Ceil(cfg.QPS))))
@@ -120,49 +122,23 @@ func New(cfg Config) gin.HandlerFunc {
 
 		c.Next()
 	}
+
+	return handler, l.Stop
 }
 
-// StringToBytes 将字符串转换为字节切片（零拷贝）。
-// 注意：返回切片只允许只读访问，不可修改。
-func StringToBytes(s string) []byte {
-	if len(s) == 0 {
-		return nil
-	}
-
-	x := (*[2]uintptr)(unsafe.Pointer(&s))
-	h := [3]uintptr{x[0], x[1], x[1]}
-	return *(*[]byte)(unsafe.Pointer(&h))
-}
-
-//go:inline
-func extractLastOctet(ipStr string) int {
-	n := len(ipStr)
-	if n == 0 {
-		return 0
-	}
-
-	p := n - 1
-	for p >= 0 && ipStr[p] != '.' {
-		p--
-	}
-	if p < 0 || p+1 >= n {
-		return 0
-	}
-
-	result := 0
-	for p = p + 1; p < n; p++ {
-		c := ipStr[p]
-		if c < '0' || c > '9' {
-			break
-		}
-		result = result*10 + int(c-'0')
-	}
-	return result
-}
-
-//go:inline
+// getShardIndex 对 IP 字符串使用内联 FNV-1a hash 取模 256。
+// 内联计算避免 fnv.New32a() 的堆分配，每次调用节省 1 alloc。
 func getShardIndex(ipStr string) int {
-	return extractLastOctet(ipStr) % numShards
+	const (
+		fnvOffset32 uint32 = 2166136261
+		fnvPrime32  uint32 = 16777619
+	)
+	h := fnvOffset32
+	for i := 0; i < len(ipStr); i++ {
+		h ^= uint32(ipStr[i])
+		h *= fnvPrime32
+	}
+	return int(h) % numShards
 }
 
 // allowIP 检查并更新IP的限流状态
@@ -176,7 +152,7 @@ func (l *limiter) allowIP(ipStr string) (bool, time.Duration, *rate.Reservation)
 
 	if v, ok := l.shards[shardIdx].Load(ipStr); ok {
 		il := v.(*ipLimiter)
-		il.lastSeen = now
+		il.lastSeen.Store(now.UnixNano())
 		r := il.limiter.Reserve()
 		if !r.OK() {
 			return false, 0, nil
@@ -184,11 +160,18 @@ func (l *limiter) allowIP(ipStr string) (bool, time.Duration, *rate.Reservation)
 		return true, r.Delay(), r
 	}
 
-	il := &ipLimiter{
-		limiter:  rate.NewLimiter(rate.Limit(l.cfg.QPS), l.cfg.Burst),
-		lastSeen: now,
+	// 使用 LoadOrStore 避免并发场景下重复创建 limiter。
+	// 若两个 goroutine 同时到达此处，只有一个能成功 Store，另一个使用已存储的值。
+	newIL := &ipLimiter{
+		limiter: rate.NewLimiter(rate.Limit(l.cfg.QPS), l.cfg.Burst),
 	}
-	l.shards[shardIdx].Store(ipStr, il)
+	newIL.lastSeen.Store(now.UnixNano())
+	actual, loaded := l.shards[shardIdx].LoadOrStore(ipStr, newIL)
+	il := actual.(*ipLimiter)
+	if loaded {
+		// 另一个 goroutine 已存储，更新 lastSeen 并使用已有 limiter
+		il.lastSeen.Store(now.UnixNano())
+	}
 	r := il.limiter.Reserve()
 	if !r.OK() {
 		return false, 0, nil
@@ -210,7 +193,8 @@ func (l *limiter) cleanupExpired() {
 			for i := range l.shards {
 				l.shards[i].Range(func(key, value any) bool {
 					il := value.(*ipLimiter)
-					if now.Sub(il.lastSeen) > ttl {
+					lastSeen := time.Unix(0, il.lastSeen.Load())
+					if now.Sub(lastSeen) > ttl {
 						l.shards[i].Delete(key)
 					}
 					return true

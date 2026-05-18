@@ -2,6 +2,7 @@ package auth
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -39,8 +40,7 @@ func JWTAuth(cfg JWTAuthConfig) gin.HandlerFunc {
 			return
 		}
 
-		authHeaderLen := len(authHeader)
-		if authHeaderLen > 7 && authHeader[0] == 'B' && authHeader[1] == 'e' && authHeader[2] == 'a' && authHeader[3] == 'r' && authHeader[4] == 'e' && authHeader[5] == 'r' && authHeader[6] == ' ' {
+		if strings.HasPrefix(authHeader, "Bearer ") {
 			tokenStr := authHeader[7:]
 			if len(tokenStr) > 0 {
 				token, err := jwt.Parse(tokenStr, keyFunc)

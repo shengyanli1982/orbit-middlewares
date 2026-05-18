@@ -5,31 +5,21 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/shengyanli1982/orbit-middlewares.svg)](https://pkg.go.dev/github.com/shengyanli1982/orbit-middlewares)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/shengyanli1982/orbit-middlewares)
 
-`orbit-middlewares` is a production-oriented middleware toolkit for Go teams using the Gin web framework. It provides essential request processing capabilities including authentication, rate limiting, filtering, and observability — all with clear contracts and minimal overhead.
-
-You can compose these middlewares in any combination to build secure, observable, and resilient API services without changing your mental model.
-
-## Why Teams Choose Orbit Middlewares
-
-- **One library, full request pipeline**: from authentication and authorization to rate limiting, timeout control, and request tracing.
-- **Built for hot paths**: O(1) IP/key lookups via `map[string]struct{}`, sharded rate limiter storage with `sync.Map`, zero-copy conversions where possible.
-- **Clear failure semantics**: explicit error responses with descriptive messages, typed error codes for upstream handling.
-- **Cross-platform confidence**: CI runs `go test -v ./...` on Linux, macOS, and Windows.
-- **Evidence over slogans**: the library focuses on correctness and performance without unnecessary complexity.
+A production-ready middleware toolkit for Go services built on [Gin](https://github.com/gin-gonic/gin). Covers the full request pipeline — authentication, rate limiting, observability, security hardening, and more.
 
 ## Middleware Portfolio
 
-| Middleware    | Best for             | Key capability                                              |
-| ------------- | -------------------- | ----------------------------------------------------------- |
-| `IPFilter`    | Access control       | IP whitelist/blacklist with O(1) lookup                     |
-| `JWTAuth`     | Token authentication | HMAC signature validation with custom KeyFunc support       |
-| `APIKeyAuth`  | API key validation   | Multi-key support with custom Validator function            |
-| `RateLimiter` | Request throttling   | Token bucket algorithm, global or per-IP mode               |
-| `RequestID`   | Request tracing      | ID propagation or generation with crypto/rand               |
-| `RequestSize` | Payload protection   | Body size limit before reading                              |
-| `Timeout`     | Deadline control     | Context-based timeout with proper cancellation              |
-| `Compression` | Response compression | GZIP compression with configurable level and excluded paths |
-| `Security`    | Security hardening   | HTTP security headers (CSP, HSTS, X-Frame-Options, etc.)    |
+| Middleware    | Purpose              | Key behavior                                           |
+| ------------- | -------------------- | ------------------------------------------------------ |
+| `IPFilter`    | Access control       | IP whitelist/blacklist with CIDR support               |
+| `JWTAuth`     | Token authentication | HMAC signature validation, custom KeyFunc support      |
+| `APIKeyAuth`  | API key validation   | Header/query lookup, custom Validator function         |
+| `RateLimiter` | Request throttling   | Token bucket, global or per-IP mode with 256 shards    |
+| `RequestID`   | Request tracing      | Propagates or generates a crypto-random ID per request |
+| `RequestSize` | Payload protection   | Limits body size, blocks chunked transfer bypass       |
+| `Timeout`     | Deadline control     | Per-request timeout with goroutine-safe implementation |
+| `Compression` | Response compression | GZIP with configurable level and path exclusions       |
+| `Security`    | Security headers     | CSP, HSTS, X-Frame-Options, and more                   |
 
 ## Quick Start
 
@@ -48,81 +38,79 @@ import (
 	"github.com/shengyanli1982/orbit"
 	"github.com/shengyanli1982/orbit-middlewares/middleware/auth"
 	"github.com/shengyanli1982/orbit-middlewares/middleware/compression"
-	"github.com/shengyanli1982/orbit-middlewares/middleware/ipfilter"
 	"github.com/shengyanli1982/orbit-middlewares/middleware/ratelimiter"
 	"github.com/shengyanli1982/orbit-middlewares/middleware/requestid"
-	"github.com/shengyanli1982/orbit-middlewares/middleware/requestsize"
 	"github.com/shengyanli1982/orbit-middlewares/middleware/security"
 	"github.com/shengyanli1982/orbit-middlewares/middleware/timeout"
 )
-
-type DemoService struct{}
-
-func (s *DemoService) RegisterGroup(g *gin.RouterGroup) {
-	g.GET("/ping", func(c *gin.Context) {
-		requestID, _ := c.Get("request_id")
-		c.JSON(http.StatusOK, gin.H{
-			"message":    "pong",
-			"request_id": requestID,
-		})
-	})
-}
 
 func main() {
 	config := orbit.NewConfig()
 	opts := orbit.NewOptions()
 	engine := orbit.NewEngine(config, opts)
 
-	engine.RegisterMiddleware(requestid.New(requestid.Config{}))
+	engine.RegisterMiddleware(requestid.New(requestid.DefaultConfig()))
 	engine.RegisterMiddleware(security.New(security.DefaultConfig()))
-	engine.RegisterMiddleware(compression.New(compression.Config{
-		MinLength: 1024,
-	}))
-	engine.RegisterMiddleware(ipfilter.New(ipfilter.Config{
-		BlockedIPs: []string{"192.168.1.100"},
-	}))
-	engine.RegisterMiddleware(requestsize.New(requestsize.Config{
-		MaxSize: 10 * 1024 * 1024,
-	}))
-	engine.RegisterMiddleware(timeout.New(timeout.Config{
-		Timeout: 10 * time.Second,
-	}))
-	engine.RegisterMiddleware(ratelimiter.New(ratelimiter.Config{
+	engine.RegisterMiddleware(compression.New(compression.DefaultConfig()))
+
+	rateLimitHandler, stop := ratelimiter.New(ratelimiter.Config{
 		Mode:  ratelimiter.ModeIP,
 		QPS:   100,
 		Burst: 200,
+	})
+	defer stop()
+	engine.RegisterMiddleware(rateLimitHandler)
+
+	engine.RegisterMiddleware(timeout.New(timeout.Config{
+		Engine:  engine.GetGinEngine(), // pass the underlying *gin.Engine
+		Timeout: 10 * time.Second,
 	}))
+
 	engine.RegisterMiddleware(auth.APIKeyAuth(auth.APIKeyAuthConfig{
 		HeaderName: "X-API-Key",
-		APIKeys:    []string{"admin-key", "user-key"},
+		APIKeys:    []string{"key-prod-1"},
 	}))
 
 	engine.RegisterService(&DemoService{})
-
 	engine.Run()
 	time.Sleep(30 * time.Second)
 	engine.Stop()
 }
+
+type DemoService struct{}
+
+func (s *DemoService) RegisterGroup(g *gin.RouterGroup) {
+	g.GET("/ping", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"message":    "pong",
+			"request_id": c.GetString("request_id"),
+		})
+	})
+}
 ```
 
-## Middleware Details
+## Middleware Reference
 
 ### IPFilter
 
-IP address filtering with whitelist and blacklist support.
+Blocks or allows requests by client IP. Blacklist takes priority over whitelist. Supports exact IPs and CIDR ranges.
 
 ```go
 engine.RegisterMiddleware(ipfilter.New(ipfilter.Config{
-    AllowedIPs: []string{"10.0.0.0/8"},
-    BlockedIPs: []string{"192.168.1.100"},
+    AllowedIPs: []string{"10.0.0.0/8", "192.168.1.50"},
+    BlockedIPs: []string{"1.2.3.4"},
 }))
 ```
 
-- Returns `403 Forbidden` with message `"[403] ip blocked"` or `"[403] ip not allowed"`
+- Returns `403 Forbidden` with `"[403] ip blocked"` or `"[403] ip not allowed"`
+- When only `BlockedIPs` is set, all other IPs are allowed
+- When only `AllowedIPs` is set, all other IPs are blocked
+
+---
 
 ### JWTAuth
 
-JWT token validation with HMAC signature verification.
+Validates `Authorization: Bearer <token>` using HMAC by default.
 
 ```go
 engine.RegisterMiddleware(auth.JWTAuth(auth.JWTAuthConfig{
@@ -130,113 +118,150 @@ engine.RegisterMiddleware(auth.JWTAuth(auth.JWTAuthConfig{
 }))
 ```
 
-- Parses `Authorization: Bearer <token>` header
-- Stores valid claims in `c.Set("jwt_claims", claims)`
-- Returns `401 Unauthorized` on validation failure
+Valid claims are stored in `c.Get("jwt_claims")`. Returns `401 Unauthorized` on failure.
+
+Custom key function (e.g. RS256):
+
+```go
+engine.RegisterMiddleware(auth.JWTAuth(auth.JWTAuthConfig{
+    KeyFunc: func(token *jwt.Token) (interface{}, error) {
+        return rsaPublicKey, nil
+    },
+}))
+```
+
+---
 
 ### APIKeyAuth
 
-API key authentication with multi-key and custom validator support.
+Checks the API key from a header or query parameter.
 
 ```go
 engine.RegisterMiddleware(auth.APIKeyAuth(auth.APIKeyAuthConfig{
     HeaderName: "X-API-Key",
     QueryParam: "api_key",
-    APIKeys:    []string{"key1", "key2"},
+    APIKeys:    []string{"key-prod-1", "key-prod-2"},
+}))
+```
+
+Custom validator (e.g. database lookup):
+
+```go
+engine.RegisterMiddleware(auth.APIKeyAuth(auth.APIKeyAuthConfig{
+    HeaderName: "X-API-Key",
     Validator: func(key string, c *gin.Context) bool {
-        return validateAgainstDB(key)
+        return db.IsValidKey(key)
     },
 }))
 ```
 
-- Checks query parameter first, then header
-- Returns `401 Unauthorized` with reason
+Returns `401 Unauthorized` on failure.
+
+---
 
 ### RateLimiter
 
-Token bucket rate limiter with global or per-IP modes.
+Token bucket limiter. `New` returns `(handler, stop)` — call `stop()` when the server shuts down to release the background cleanup goroutine.
 
 ```go
-engine.RegisterMiddleware(ratelimiter.New(ratelimiter.Config{
-    Mode:  ratelimiter.ModeIP,
+handler, stop := ratelimiter.New(ratelimiter.Config{
+    Mode:  ratelimiter.ModeIP,   // or ratelimiter.ModeGlobal
     QPS:   100,
     Burst: 200,
-    TTL:   5 * time.Minute,
-}))
+    TTL:   5 * time.Minute,      // how long to keep idle per-IP state
+})
+defer stop()
+engine.RegisterMiddleware(handler)
 ```
 
-- `ModeGlobal`: single bucket for all requests
-- `ModeIP`: per-client-IP limiting with 256 shards
-- Adds `X-RateLimit-Limit` and `Retry-After` headers
+- `ModeGlobal`: one shared bucket for all requests
+- `ModeIP`: per-client-IP bucket, 256 shards, IPv4 and IPv6 supported
+- Adds `X-RateLimit-Limit` and `Retry-After` response headers
 - Returns `429 Too Many Requests` when exceeded
+
+---
 
 ### RequestID
 
-Request tracing ID generation and propagation.
+Reuses the client-provided ID from the request header, or generates a new 16-byte crypto-random ID.
 
 ```go
+// default: header name "X-Request-ID"
+engine.RegisterMiddleware(requestid.New(requestid.DefaultConfig()))
+
+// custom header name
 engine.RegisterMiddleware(requestid.New(requestid.Config{
-    HeaderName: "X-Request-ID",
+    HeaderName: "X-Trace-ID",
 }))
 ```
 
-- Reuses client-provided ID if present
-- Generates 16-byte cryptographically random ID if not
-- Stores ID in `c.Set("request_id", requestID)`
+The ID is stored in `c.Set("request_id", id)` and written back to the response header. Read it downstream with `c.GetString("request_id")`.
+
+---
 
 ### RequestSize
 
-Maximum request body size limit.
+Limits the maximum request body size. Uses `http.MaxBytesReader` to enforce the limit on actual reads, preventing chunked transfer bypass.
 
 ```go
 engine.RegisterMiddleware(requestsize.New(requestsize.Config{
-    MaxSize: 5 * 1024 * 1024,
+    MaxSize: 10 * 1024 * 1024, // 10 MB
 }))
 ```
 
-- Returns `413 Request Entity Too Large` if exceeded
+Returns `413 Request Entity Too Large` if exceeded. `MaxSize` must be > 0.
+
+---
 
 ### Timeout
 
-Request timeout control with proper context cancellation.
+Enforces a per-request deadline. Requires the `*gin.Engine` instance to create an isolated context per request, avoiding `gin.Context` data races.
 
 ```go
 engine.RegisterMiddleware(timeout.New(timeout.Config{
+    Engine:  engine.GetGinEngine(), // required
     Timeout: 30 * time.Second,
 }))
 ```
 
-- Returns `504 Gateway Timeout` if timeout exceeded
+Returns `504 Gateway Timeout` if the deadline is exceeded. The background goroutine is always waited on before returning, preventing goroutine leaks.
+
+---
 
 ### Compression
 
-HTTP response compression using gzip.
+GZIP-compresses responses above a minimum size threshold.
 
 ```go
+// defaults: MinLength=1024, Level=DefaultCompression
+engine.RegisterMiddleware(compression.New(compression.DefaultConfig()))
+
+// custom config
 engine.RegisterMiddleware(compression.New(compression.Config{
-    MinLength:       1024,
-    CompressionLevel: compression.DefaultCompression,
+    MinLength:        2048,
+    CompressionLevel: compression.BestSpeed,
+    ExcludedPaths:    []string{"/metrics"},
+    ExcludedExts:     []string{".jpg", ".png", ".gif"},
 }))
 ```
 
-- Supports gzip compression with configurable level
-- Adds `Content-Encoding: gzip` and `Vary: Accept-Encoding` headers
-- Skips compression for error responses (4xx, 5xx)
-- Excludes specified paths and file extensions
+- Skips compression for error responses (4xx/5xx)
+- Adds `Content-Encoding: gzip` and `Vary: Accept-Encoding`
+- Reuses `gzip.Writer` via `sync.Pool`
+
+---
 
 ### Security
 
-HTTP security headers for production applications.
+Sets HTTP security headers. Three built-in presets:
 
 ```go
-engine.RegisterMiddleware(security.New(security.DefaultConfig()))
+engine.RegisterMiddleware(security.New(security.DefaultConfig())) // production
+engine.RegisterMiddleware(security.New(security.StrictConfig()))  // high security
+engine.RegisterMiddleware(security.New(security.LaxConfig()))     // development
 ```
 
-Available presets:
-
-- `DefaultConfig()`: Production-safe defaults
-- `StrictConfig()`: Higher security requirements
-- `LaxConfig()`: Development/testing
+Custom config:
 
 ```go
 engine.RegisterMiddleware(security.New(security.Config{
@@ -244,57 +269,61 @@ engine.RegisterMiddleware(security.New(security.Config{
     XContentTypeOptions: "nosniff",
     HSTSMaxAge:          31536000,
     CSP:                 "default-src 'self'",
+    ReferrerPolicy:      "strict-origin-when-cross-origin",
 }))
 ```
 
-Sets the following headers:
+Headers set: `X-Frame-Options`, `X-Content-Type-Options`, `Strict-Transport-Security`, `Content-Security-Policy`, `X-XSS-Protection`, `Referrer-Policy`, `Permissions-Policy`.
 
-- `X-Frame-Options`: Clickjacking protection (DENY/SAMEORIGIN)
-- `X-Content-Type-Options`: MIME-sniffing prevention (nosniff)
-- `Strict-Transport-Security`: HTTPS enforcement (HSTS)
-- `Content-Security-Policy`: XSS and injection protection
-- `X-XSS-Protection`: Legacy XSS filter compatibility
-- `Referrer-Policy`: Referrer information control
-- `Permissions-Policy`: Browser feature restrictions
+---
 
-## Example Projects
+## Skipper
 
-Runnable demos:
+Every middleware accepts an optional `Skipper` function to bypass processing for specific requests:
 
-- [`examples/requestid_example.go`](./examples/requestid_example.go)
-- [`examples/ratelimiter_global_example.go`](./examples/ratelimiter_global_example.go)
-- [`examples/ratelimiter_ip_example.go`](./examples/ratelimiter_ip_example.go)
-- [`examples/timeout_example.go`](./examples/timeout_example.go)
-- [`examples/jwt_example.go`](./examples/jwt_example.go)
-- [`examples/apikey_example.go`](./examples/apikey_example.go)
-- [`examples/requestsize_example.go`](./examples/requestsize_example.go)
-- [`examples/ipfilter_example.go`](./examples/ipfilter_example.go)
-- [`examples/compression_example.go`](./examples/compression_example.go)
-- [`examples/security_example.go`](./examples/security_example.go)
-- [`examples/combined_example.go`](./examples/combined_example.go)
-
-Run any example directly:
-
-```bash
-go run ./examples/<example_file>
+```go
+engine.RegisterMiddleware(auth.JWTAuth(auth.JWTAuthConfig{
+    Secret: []byte("secret"),
+    Skipper: func(c *gin.Context) bool {
+        return c.Request.URL.Path == "/health"
+    },
+}))
 ```
 
-## Reliability by Design
+## Examples
 
-- **Explicit error responses**: each middleware returns appropriate HTTP status codes with descriptive messages.
-- **Skipper functions**: optional per-middleware skip logic for fine-grained control.
-- **Clean separation**: each middleware is independent and can be used standalone or combined.
-- **Proper resource management**: timeout middleware properly cancels contexts, rate limiter cleans up expired entries.
+Runnable demos in [`examples/`](./examples):
 
-## API Reference
+- [`combined_example.go`](./examples/combined_example.go)
+- [`jwt_example.go`](./examples/jwt_example.go)
+- [`apikey_example.go`](./examples/apikey_example.go)
+- [`ratelimiter_ip_example.go`](./examples/ratelimiter_ip_example.go)
+- [`ratelimiter_global_example.go`](./examples/ratelimiter_global_example.go)
+- [`ipfilter_example.go`](./examples/ipfilter_example.go)
+- [`requestid_example.go`](./examples/requestid_example.go)
+- [`requestsize_example.go`](./examples/requestsize_example.go)
+- [`timeout_example.go`](./examples/timeout_example.go)
+- [`compression_example.go`](./examples/compression_example.go)
+- [`security_example.go`](./examples/security_example.go)
 
-- GoDoc: <https://pkg.go.dev/github.com/shengyanli1982/orbit-middlewares>
+## Testing
 
-## DeepWiki
-
-- <https://deepwiki.com/shengyanli1982/orbit-middlewares>
+```bash
+go test ./...
+go test -race ./...
+go test -bench=. -benchmem ./middleware/...
+```
 
 ## Related Projects
 
 - [`orbit`](https://github.com/shengyanli1982/orbit): High-performance Go web framework built on Gin
 - [`workqueue`](https://github.com/shengyanli1982/workqueue): Production-oriented queue toolkit for Go
+
+## API Reference
+
+- GoDoc: <https://pkg.go.dev/github.com/shengyanli1982/orbit-middlewares>
+- DeepWiki: <https://deepwiki.com/shengyanli1982/orbit-middlewares>
+
+## License
+
+[MIT](./LICENSE)

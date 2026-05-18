@@ -15,11 +15,12 @@ import (
 func BenchmarkTimeout_NoTimeout(b *testing.B) {
 	gin.SetMode(gin.TestMode)
 
+	router := gin.New()
 	cfg := Config{
 		Timeout: 5 * time.Second,
+		Engine:  router,
 	}
 
-	router := gin.New()
 	router.Use(New(cfg))
 	router.GET("/test", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
@@ -46,11 +47,12 @@ func BenchmarkTimeout_NoTimeout(b *testing.B) {
 func BenchmarkTimeout_Triggered(b *testing.B) {
 	gin.SetMode(gin.TestMode)
 
+	router := gin.New()
 	cfg := Config{
 		Timeout: 1 * time.Millisecond,
+		Engine:  router,
 	}
 
-	router := gin.New()
 	router.Use(New(cfg))
 	router.GET("/test", func(c *gin.Context) {
 		time.Sleep(10 * time.Millisecond)
@@ -78,11 +80,12 @@ func BenchmarkTimeout_Triggered(b *testing.B) {
 func BenchmarkTimeout_MemAllocation(b *testing.B) {
 	gin.SetMode(gin.TestMode)
 
+	router := gin.New()
 	cfg := Config{
 		Timeout: 5 * time.Second,
+		Engine:  router,
 	}
 
-	router := gin.New()
 	router.Use(New(cfg))
 	router.GET("/test", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")

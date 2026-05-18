@@ -27,22 +27,46 @@ type Config struct {
 	CompressionLevel int
 }
 
+// countingWriter 包装 io.Writer，统计实际写入字节数（即压缩后大小）。
+type countingWriter struct {
+	w       io.Writer
+	written int64
+}
+
+func (cw *countingWriter) Write(p []byte) (int, error) {
+	n, err := cw.w.Write(p)
+	cw.written += int64(n)
+	return n, err
+}
+
 type gzipWriter struct {
 	gin.ResponseWriter
 	writer            *gzip.Writer
+	counter           *countingWriter // 统计压缩后实际写入字节数
 	statusWritten     bool
 	status            int
 	minLength         int
 	shouldCompress    bool
-	written           int64
+	written           int64 // 原始数据大小（用于 minLength 判断）
 	contentLenChecked bool
 }
 
 var gzipPool = sync.Pool{
 	New: func() interface{} {
 		gz, _ := gzip.NewWriterLevel(io.Discard, DefaultCompression)
-		return &gzipWriter{writer: gz}
+		return &gzipWriter{
+			writer:  gz,
+			counter: &countingWriter{w: io.Discard},
+		}
 	},
+}
+
+// DefaultConfig 返回合理的默认配置。
+func DefaultConfig() Config {
+	return Config{
+		MinLength:        1024,
+		CompressionLevel: DefaultCompression,
+	}
 }
 
 func New(cfg Config) gin.HandlerFunc {
@@ -54,6 +78,10 @@ func New(cfg Config) gin.HandlerFunc {
 	level := cfg.CompressionLevel
 	if level == 0 {
 		level = DefaultCompression
+	}
+	// 校验 CompressionLevel 范围：gzip 支持 -2 (HuffmanOnly) 到 9 (BestCompression)
+	if level < -2 || level > 9 {
+		panic("compression: CompressionLevel must be between -2 and 9")
 	}
 
 	excludedPaths := newExcludedPaths(cfg.ExcludedPaths)
@@ -72,10 +100,24 @@ func New(cfg Config) gin.HandlerFunc {
 
 		gz := gzipPool.Get().(*gzipWriter)
 		gz.ResponseWriter = c.Writer
-		gz.writer.Reset(c.Writer)
+
+		// 重置 counter，指向底层 ResponseWriter
+		gz.counter.w = c.Writer
+		gz.counter.written = 0
+
 		if level != DefaultCompression {
-			gz.writer, _ = gzip.NewWriterLevel(c.Writer, level)
+			// 先 Close 旧 writer，避免资源泄漏
+			_ = gz.writer.Close()
+			var err error
+			gz.writer, err = gzip.NewWriterLevel(gz.counter, level)
+			if err != nil {
+				// 无效 level 已在 New 入口 panic，此处 fallback 到默认级别
+				gz.writer, _ = gzip.NewWriterLevel(gz.counter, DefaultCompression)
+			}
+		} else {
+			gz.writer.Reset(gz.counter)
 		}
+
 		gz.minLength = minLength
 		gz.written = 0
 		gz.shouldCompress = false
@@ -94,6 +136,9 @@ func New(cfg Config) gin.HandlerFunc {
 			c.Writer.Header().Set("ETag", "W/"+etag)
 		}
 
+		// Close gzip writer，将剩余缓冲数据刷入底层 writer
+		_ = gz.writer.Close()
+
 		switch {
 		case gz.status >= http.StatusBadRequest:
 			c.Writer.Header().Del("Content-Encoding")
@@ -101,12 +146,14 @@ func New(cfg Config) gin.HandlerFunc {
 		case !gz.shouldCompress:
 			c.Writer.Header().Del("Content-Encoding")
 			c.Writer.Header().Del("Vary")
-		case gz.written > 0:
-			c.Writer.Header().Set("Content-Length", strconv.Itoa(int(gz.written)))
+		case gz.counter.written > 0:
+			// 使用压缩后实际写入字节数设置 Content-Length
+			c.Writer.Header().Set("Content-Length", strconv.FormatInt(gz.counter.written, 10))
 		}
 
-		_ = gz.writer.Close()
+		// 重置 writer 到 Discard，避免持有对 ResponseWriter 的引用
 		gz.writer.Reset(io.Discard)
+		gz.counter.w = io.Discard
 		gz.ResponseWriter = nil
 		gzipPool.Put(gz)
 	}
@@ -171,6 +218,20 @@ func (g *gzipWriter) Write(data []byte) (int, error) {
 }
 
 func (g *gzipWriter) WriteString(s string) (int, error) {
+	// 直接走压缩路径的快速判断，避免 string→[]byte 转换
+	if !g.statusWritten {
+		g.status = g.ResponseWriter.Status()
+	}
+	if g.status >= http.StatusBadRequest {
+		return g.ResponseWriter.WriteString(s)
+	}
+	// 已确认需要压缩，直接写入 gzip writer，避免 []byte 转换 alloc。
+	// 同步更新 g.written，保证 Size() 返回值与 Write 路径一致。
+	if g.shouldCompress {
+		g.written += int64(len(s))
+		return io.WriteString(g.writer, s)
+	}
+	// 尚未决策，回退到通用 Write 路径（含 minLength 判断）
 	return g.Write([]byte(s))
 }
 

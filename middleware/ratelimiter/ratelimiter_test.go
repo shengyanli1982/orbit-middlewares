@@ -20,7 +20,9 @@ func TestRateLimiter_GlobalMode(t *testing.T) {
 	}
 
 	router := gin.New()
-	router.Use(New(cfg))
+	handler, stop := New(cfg)
+	defer stop()
+	router.Use(handler)
 	router.GET("/test", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
@@ -49,7 +51,9 @@ func TestRateLimiter_IPMode(t *testing.T) {
 	}
 
 	router := gin.New()
-	router.Use(New(cfg))
+	handler, stop := New(cfg)
+	defer stop()
+	router.Use(handler)
 	router.GET("/test", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
@@ -75,7 +79,9 @@ func TestRateLimiter_DifferentIPs(t *testing.T) {
 	}
 
 	router := gin.New()
-	router.Use(New(cfg))
+	handler, stop := New(cfg)
+	defer stop()
+	router.Use(handler)
 	router.GET("/test", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
@@ -107,7 +113,9 @@ func TestRateLimiter_RefillTokens(t *testing.T) {
 	}
 
 	router := gin.New()
-	router.Use(New(cfg))
+	handler, stop := New(cfg)
+	defer stop()
+	router.Use(handler)
 	router.GET("/test", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
@@ -146,7 +154,9 @@ func TestRateLimiter_Skipper(t *testing.T) {
 	}
 
 	router := gin.New()
-	router.Use(New(cfg))
+	handler, stop := New(cfg)
+	defer stop()
+	router.Use(handler)
 	router.GET("/skip", func(c *gin.Context) {
 		c.String(http.StatusOK, "skipped")
 	})
