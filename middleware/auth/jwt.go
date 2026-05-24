@@ -47,9 +47,9 @@ func JWTAuth(cfg JWTAuthConfig) gin.HandlerFunc {
 				if err == nil && token.Valid {
 					if claims, ok := token.Claims.(jwt.MapClaims); ok {
 						c.Set("jwt_claims", claims)
+						c.Next()
+						return
 					}
-					c.Next()
-					return
 				}
 			}
 		}

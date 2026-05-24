@@ -10,8 +10,9 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// contextKey 用于在 context 中标记"已在超时子请求中"，防止递归调用。
 type contextKey struct{}
+
+type ctxKey string
 
 // Config 超时中间件配置。
 type Config struct {
@@ -108,7 +109,11 @@ func New(cfg Config) gin.HandlerFunc {
 
 		// 在 context 中设置标记，防止子请求再次进入超时逻辑
 		ctxWithMark := context.WithValue(ctx, contextKey{}, true)
-		reqWithCtx := c.Request.WithContext(ctxWithMark)
+		ctxWithKeys := ctxWithMark
+		for k, v := range c.Keys {
+			ctxWithKeys = context.WithValue(ctxWithKeys, ctxKey(k), v)
+		}
+		reqWithCtx := c.Request.WithContext(ctxWithKeys)
 
 		// 子 goroutine 写入独立的 bufferWriter，与主 goroutine 完全隔离
 		bw := newBufferWriter()

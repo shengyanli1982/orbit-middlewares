@@ -43,6 +43,7 @@ type gzipWriter struct {
 	gin.ResponseWriter
 	writer            *gzip.Writer
 	counter           *countingWriter // 统计压缩后实际写入字节数
+	level             int
 	statusWritten     bool
 	status            int
 	minLength         int
@@ -57,6 +58,7 @@ var gzipPool = sync.Pool{
 		return &gzipWriter{
 			writer:  gz,
 			counter: &countingWriter{w: io.Discard},
+			level:   DefaultCompression,
 		}
 	},
 }
@@ -105,14 +107,15 @@ func New(cfg Config) gin.HandlerFunc {
 		gz.counter.w = c.Writer
 		gz.counter.written = 0
 
-		if level != DefaultCompression {
-			// 先 Close 旧 writer，避免资源泄漏
+		if gz.level != level {
 			_ = gz.writer.Close()
 			var err error
 			gz.writer, err = gzip.NewWriterLevel(gz.counter, level)
 			if err != nil {
-				// 无效 level 已在 New 入口 panic，此处 fallback 到默认级别
 				gz.writer, _ = gzip.NewWriterLevel(gz.counter, DefaultCompression)
+				gz.level = DefaultCompression
+			} else {
+				gz.level = level
 			}
 		} else {
 			gz.writer.Reset(gz.counter)
@@ -142,10 +145,10 @@ func New(cfg Config) gin.HandlerFunc {
 		switch {
 		case gz.status >= http.StatusBadRequest:
 			c.Writer.Header().Del("Content-Encoding")
-			c.Writer.Header().Del("Vary")
+			removeVaryValue(c.Writer.Header(), "Accept-Encoding")
 		case !gz.shouldCompress:
 			c.Writer.Header().Del("Content-Encoding")
-			c.Writer.Header().Del("Vary")
+			removeVaryValue(c.Writer.Header(), "Accept-Encoding")
 		case gz.counter.written > 0:
 			// 使用压缩后实际写入字节数设置 Content-Length
 			c.Writer.Header().Set("Content-Length", strconv.FormatInt(gz.counter.written, 10))
@@ -293,4 +296,19 @@ func newExcludedExtensions(exts []string) excludedExtensions {
 func (e excludedExtensions) Contains(ext string) bool {
 	_, ok := e[ext]
 	return ok
+}
+
+func removeVaryValue(h http.Header, value string) {
+	vals := h.Values("Vary")
+	remaining := vals[:0]
+	for _, v := range vals {
+		if !strings.EqualFold(v, value) {
+			remaining = append(remaining, v)
+		}
+	}
+	if len(remaining) > 0 {
+		h["Vary"] = remaining
+	} else {
+		h.Del("Vary")
+	}
 }

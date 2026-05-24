@@ -65,8 +65,9 @@ func New(cfg Config) (gin.HandlerFunc, func()) {
 		stopCh: make(chan struct{}),
 	}
 
-	// 启动后台清理goroutine
-	go l.cleanupExpired()
+	if cfg.Mode == ModeIP {
+		go l.cleanupExpired()
+	}
 
 	handler := func(c *gin.Context) {
 		if cfg.Skipper != nil && cfg.Skipper(c) {

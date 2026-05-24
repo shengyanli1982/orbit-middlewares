@@ -168,8 +168,8 @@ func TestIPLimiter_MixedExactAndCIDR(t *testing.T) {
 		wantCode   int
 	}{
 		{"192.168.1.50:1234", http.StatusOK},    // 在 CIDR 内
-		{"10.0.0.1:1234", http.StatusOK},         // 精确匹配
-		{"10.0.0.2:1234", http.StatusForbidden},  // 不在白名单
+		{"10.0.0.1:1234", http.StatusOK},        // 精确匹配
+		{"10.0.0.2:1234", http.StatusForbidden}, // 不在白名单
 	}
 
 	for _, tc := range cases {
