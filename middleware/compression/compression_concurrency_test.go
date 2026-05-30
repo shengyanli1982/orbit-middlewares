@@ -25,7 +25,7 @@ func init() {
 func newHTTPClient() *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
-			DisableCompression: true,
+			DisableCompression:  true,
 			MaxIdleConns:        200,
 			MaxIdleConnsPerHost: 200,
 			IdleConnTimeout:     0,
@@ -430,4 +430,3 @@ func BenchmarkCompression_LargeResponse_RealHTTP(b *testing.B) {
 		resp.Body.Close()
 	}
 }
-
