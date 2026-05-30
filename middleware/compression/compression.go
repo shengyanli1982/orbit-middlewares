@@ -1,8 +1,19 @@
+// Package compression implements gzip compression middleware for Gin.
+//
+// Design (inspired by gin-contrib/gzip):
+//   - Content-Encoding: gzip is set EAGERLY before c.Next() as a HINT to the client.
+//   - The compression decision is LAZY: body data is buffered until MinLength is reached.
+//   - If body < MinLength, headers are never committed, so we can safely strip the hint.
+//   - Error responses (4xx/5xx) bypass compression entirely (no double-gzip risk).
+//   - Already-compressed responses (e.g. handler set Content-Encoding: gzip) are passed through.
 package compression
 
 import (
+	"bufio"
+	"bytes"
 	"compress/gzip"
 	"io"
+	"net"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -17,10 +28,17 @@ const (
 	BestSpeed          = gzip.BestSpeed
 	DefaultCompression = gzip.DefaultCompression
 	NoCompression      = gzip.NoCompression
+	HuffmanOnly        = gzip.HuffmanOnly
 )
 
-const maxBufCap = 65536
+const (
+	headerAcceptEncoding  = "Accept-Encoding"
+	headerContentEncoding = "Content-Encoding"
+	headerVary            = "Vary"
+	gzipEncoding          = "gzip"
+)
 
+// Config holds middleware configuration.
 type Config struct {
 	Skipper          func(*gin.Context) bool
 	ExcludedPaths    []string
@@ -29,6 +47,16 @@ type Config struct {
 	CompressionLevel int
 }
 
+// DefaultConfig returns sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		MinLength:        1024,
+		CompressionLevel: DefaultCompression,
+	}
+}
+
+// countingWriter wraps an io.Writer and tracks the number of bytes written through it.
+// Used to measure compressed output size (for accurate Content-Length).
 type countingWriter struct {
 	w       io.Writer
 	written int64
@@ -40,39 +68,167 @@ func (cw *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// gzipWriter wraps gin.ResponseWriter and buffers body data before deciding to compress.
 type gzipWriter struct {
 	gin.ResponseWriter
-	writer          *gzip.Writer
-	counter         *countingWriter
-	level           int
-	statusWritten   bool
-	status          int
-	minLength       int
-	shouldCompress  bool
-	written         int64
-	headerCommitted bool
-	buf             []byte
-	gzClosed        bool
+	writer        *gzip.Writer
+	counter       *countingWriter
+	statusWritten bool
+	status        int
+	minLength     int
+	shouldCompress bool
+	buf           bytes.Buffer
+}
+
+var _ http.Hijacker = (*gzipWriter)(nil)
+
+func (g *gzipWriter) WriteString(s string) (int, error) {
+	return g.Write([]byte(s))
+}
+
+// Write implements io.Writer. The strategy:
+//  1. Status >= 400 (error response): pass through uncompressed, remove gzip headers.
+//  2. Already-compressed upstream (Content-Encoding != gzip): pass through, remove gzip headers.
+//  3. Already-compressed upstream (Content-Encoding == gzip with gzip magic): pass through.
+//  4. Content-Length header present: use it as a fast-path decision (no buffering).
+//  5. Otherwise: buffer data. Once buf >= minWidth, mark shouldCompress=true and flush buf+zlib.
+func (g *gzipWriter) Write(data []byte) (int, error) {
+	if !g.statusWritten {
+		g.status = g.ResponseWriter.Status()
+	}
+
+	// Error responses: don't compress, pass through
+	if g.status >= http.StatusBadRequest {
+		g.removeGzipHeaders()
+		return g.ResponseWriter.Write(data)
+	}
+
+	// Check if response is already compressed by upstream
+	if ce := g.Header().Get(headerContentEncoding); ce != "" && ce != gzipEncoding {
+		// Different encoding (e.g. br, deflate): pass through, remove our gzip headers
+		g.removeGzipHeaders()
+		return g.ResponseWriter.Write(data)
+	} else if ce == gzipEncoding {
+		// Handler already set gzip: if the data is actual gzip, pass through AS-IS
+		// (don't remove the handler's CE: gzip, just skip double-compression)
+		if len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+			return g.ResponseWriter.Write(data)
+		}
+		// Data doesn't look like gzip despite CE: gzip - fall through to try compressing
+	}
+
+	// Use Content-Length as fast-path decision (no need to buffer when we know the size)
+	if clStr := g.Header().Get("Content-Length"); clStr != "" {
+		if cl, err := strconv.Atoi(clStr); err == nil {
+			if cl < g.minLength {
+				return g.ResponseWriter.Write(data)
+			}
+			g.shouldCompress = true
+			g.Header().Del("Content-Length")
+		}
+	}
+
+	// Decide via buffering
+	if !g.shouldCompress {
+		if len(data) >= g.minLength {
+			// Single write exceeds threshold: compress
+			g.shouldCompress = true
+		} else {
+			// Buffer and wait for threshold
+			n, err := g.buf.Write(data)
+			if err != nil || g.buf.Len() < g.minLength {
+				return n, err
+			}
+			// Threshold reached: compress everything buffered
+			g.shouldCompress = true
+			data = g.buf.Bytes()
+		}
+	}
+
+	// COMMIT POINT: we are about to write compressed data. The gzip.Writer's Write
+	// will flow through to the underlying gin.ResponseWriter.Write, which internally
+	// calls WriteHeaderNow() and commits headers. Weaken ETag before this happens
+	// so the header map contains the weak version when committed.
+	if etag := g.Header().Get("ETag"); etag != "" && !strings.HasPrefix(etag, "W/") {
+		g.Header().Set("ETag", "W/"+etag)
+	}
+
+	return g.writer.Write(data)
+}
+
+// Status returns the current HTTP status code (explicitly set or underlying).
+func (g *gzipWriter) Status() int {
+	if g.statusWritten {
+		return g.status
+	}
+	return g.ResponseWriter.Status()
+}
+
+// Size returns bytes written to the underlying writer (uncompressed size).
+func (g *gzipWriter) Size() int {
+	return g.ResponseWriter.Size()
+}
+
+// Written returns true if the response body was already written.
+func (g *gzipWriter) Written() bool {
+	return g.ResponseWriter.Written()
+}
+
+// WriteHeaderNow delegates to the underlying writer.
+// Note: This commits headers to the HTTP connection. If body is buffered but not
+// yet compressed, the caller should be aware the headers include Content-Encoding
+// (which can still be modified until the HTTP flush after handler returns).
+func (g *gzipWriter) WriteHeaderNow() {
+	g.ResponseWriter.WriteHeaderNow()
+}
+
+// WriteHeader records the status code and updates the underlying writer's status,
+// but does NOT commit headers. This allows ETag weakening and other header mutations
+// to occur in deferred cleanup after the handler finishes (gin-contrib/gzip pattern).
+// In gin, WriteHeader only updates an internal status field; actual header commitment
+// happens later in WriteHeaderNow() which is called from Write().
+func (g *gzipWriter) WriteHeader(code int) {
+	g.status = code
+	g.statusWritten = true
+	g.ResponseWriter.WriteHeader(code) // Only updates underlying status, doesn't commit
+}
+
+// Flush flushes the gzip writer (if compressing) then the underlying writer.
+func (g *gzipWriter) Flush() {
+	if g.shouldCompress {
+		_ = g.writer.Flush()
+	}
+	g.ResponseWriter.Flush()
+}
+
+// Hijack implements http.Hijacker by delegating.
+func (g *gzipWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return g.ResponseWriter.Hijack()
+}
+
+// removeGzipHeaders removes all compression-related headers.
+// Safe to call only before headers are committed (before first Write to underlying writer).
+func (g *gzipWriter) removeGzipHeaders() {
+	g.Header().Del(headerContentEncoding)
+	g.Header().Del(headerVary)
+	g.Header().Del("ETag")
+}
+
+// gzipPool manages a pool of gzip.Writer + countingWriter pairs.
+type gzBundle struct {
+	gz      *gzip.Writer
+	counter *countingWriter
 }
 
 var gzipPool = sync.Pool{
 	New: func() interface{} {
-		gz, _ := gzip.NewWriterLevel(io.Discard, DefaultCompression)
-		return &gzipWriter{
-			writer:  gz,
-			counter: &countingWriter{w: io.Discard},
-			level:   DefaultCompression,
-		}
+		cw := &countingWriter{w: io.Discard}
+		gz, _ := gzip.NewWriterLevel(cw, DefaultCompression)
+		return &gzBundle{gz: gz, counter: cw}
 	},
 }
 
-func DefaultConfig() Config {
-	return Config{
-		MinLength:        1024,
-		CompressionLevel: DefaultCompression,
-	}
-}
-
+// New creates the compression middleware handler.
 func New(cfg Config) gin.HandlerFunc {
 	minLength := cfg.MinLength
 	if minLength <= 0 {
@@ -101,246 +257,99 @@ func New(cfg Config) gin.HandlerFunc {
 			return
 		}
 
-		gz := gzipPool.Get().(*gzipWriter)
-		gz.ResponseWriter = c.Writer
+		bundle := gzipPool.Get().(*gzBundle)
 
-		gz.counter.w = c.Writer
-		gz.counter.written = 0
-
-		if gz.level != level {
-			_ = gz.writer.Close()
-			var err error
-			gz.writer, err = gzip.NewWriterLevel(gz.counter, level)
-			if err != nil {
-				gz.writer, _ = gzip.NewWriterLevel(gz.counter, DefaultCompression)
-				gz.level = DefaultCompression
-			} else {
-				gz.level = level
-			}
+		// Reset gzip writer to output to the ResponseWriter (via countingWriter)
+		bundle.counter.w = c.Writer
+		bundle.counter.written = 0
+		if bundle.gz == nil {
+			bundle.gz, _ = gzip.NewWriterLevel(bundle.counter, level)
 		} else {
-			gz.writer.Reset(gz.counter)
+			bundle.gz.Reset(bundle.counter)
 		}
 
-		gz.minLength = minLength
-		gz.written = 0
-		gz.shouldCompress = false
-		gz.statusWritten = false
-		gz.status = http.StatusOK
-		gz.headerCommitted = false
-		gz.gzClosed = false
-		gz.buf = gz.buf[:0]
-		if cap(gz.buf) < minLength {
-			gz.buf = make([]byte, 0, minLength)
+		// EAGER: set Content-Encoding as a HINT. If body ends up small or status
+		// is >= 400, we'll strip these headers in deferred cleanup (which runs
+		// BEFORE Go's http server flushes headers to wire).
+		c.Header(headerContentEncoding, gzipEncoding)
+		c.Writer.Header().Add(headerVary, headerAcceptEncoding)
+
+		gw := &gzipWriter{
+			ResponseWriter: c.Writer,
+			writer:         bundle.gz,
+			counter:        bundle.counter,
+			minLength:      minLength,
+			status:         c.Writer.Status(),
 		}
+		c.Writer = gw
 
-		c.Writer = gz
+		defer func() {
+			switch {
+			case gw.status >= http.StatusBadRequest:
+				// Error response: strip compression headers, reset gzip
+				gw.removeGzipHeaders()
+				bundle.gz.Reset(io.Discard)
 
-		c.Writer.Header().Add("Vary", "Accept-Encoding")
+			case !gw.shouldCompress:
+				// Body was too small to compress. Since gw.Write only buffered (never
+				// wrote to the underlying writer), headers have NOT been committed.
+				// Safe to strip the Content-Encoding hint.
+				gw.Header().Del(headerContentEncoding)
+				gw.Header().Del(headerVary)
+				gw.Header().Del("ETag")
+				_, _ = gw.ResponseWriter.Write(gw.buf.Bytes())
+				bundle.gz.Reset(io.Discard)
+
+			default:
+				// Compressed successfully. ETag weakening was already done in
+				// gzipWriter.Write before the first compressing write.
+				// Will Close() below to write gzip footer.
+			}
+
+			// Close the gzip writer (writes footer if used, or no-ops if Reset'd)
+			_ = bundle.gz.Close()
+
+			// Set Content-Length based on actual bytes written
+			if gw.shouldCompress {
+				c.Header("Content-Length", strconv.FormatInt(bundle.counter.written, 10))
+			} else if gw.ResponseWriter.Size() >= 0 {
+				c.Header("Content-Length", strconv.Itoa(gw.ResponseWriter.Size()))
+			}
+
+			// Release countingWriter's reference to c.Writer (avoid keeping ResponseWriter alive)
+			bundle.counter.w = io.Discard
+			gzipPool.Put(bundle)
+		}()
 
 		c.Next()
-
-		gz.flush()
-
-		c.Writer = gz.ResponseWriter
-
-		// ETag weakening is now handled inside commitHeaders() before header commit
-
-		switch {
-		case gz.status >= http.StatusBadRequest:
-			if !gz.headerCommitted {
-				c.Writer.Header().Del("Content-Encoding")
-				c.Writer.Header().Del("Content-Length")
-				removeVaryValue(c.Writer.Header(), "Accept-Encoding")
-			}
-		case !gz.shouldCompress:
-			c.Writer.Header().Del("Content-Encoding")
-			c.Writer.Header().Del("Content-Length")
-			removeVaryValue(c.Writer.Header(), "Accept-Encoding")
-			if len(gz.buf) > 0 {
-				_, _ = gz.ResponseWriter.Write(gz.buf)
-			}
-		case gz.counter.written > 0:
-			c.Writer.Header().Set("Content-Length", strconv.FormatInt(gz.counter.written, 10))
-		}
-
-		gz.writer.Reset(io.Discard)
-		gz.counter.w = io.Discard
-		gz.ResponseWriter = nil
-		if cap(gz.buf) > maxBufCap {
-			gz.buf = nil
-		}
-		gzipPool.Put(gz)
 	}
 }
 
+// shouldCompress decides whether a response should be compressed based on the request.
 func shouldCompress(req *http.Request, paths excludedPaths, exts excludedExtensions) bool {
-	if !strings.Contains(req.Header.Get("Accept-Encoding"), "gzip") {
+	if !strings.Contains(req.Header.Get(headerAcceptEncoding), gzipEncoding) {
 		return false
 	}
-
 	if strings.Contains(req.Header.Get("Connection"), "Upgrade") {
 		return false
 	}
-
-	if paths.Contains(req.URL.Path) || exts.Contains(filepath.Ext(req.URL.Path)) {
+	if paths.Contains(req.URL.Path) {
 		return false
 	}
-
+	if exts.Contains(filepath.Ext(req.URL.Path)) {
+		return false
+	}
 	return true
 }
 
-func (g *gzipWriter) commitHeaders() {
-	if etag := g.ResponseWriter.Header().Get("ETag"); etag != "" {
-		if !strings.HasPrefix(etag, "W/") {
-			g.ResponseWriter.Header().Set("ETag", "W/"+etag)
-		}
-	}
-	g.ResponseWriter.WriteHeader(g.status)
-	g.ResponseWriter.WriteHeaderNow()
-}
-
-func (g *gzipWriter) Write(data []byte) (int, error) {
-	if !g.statusWritten {
-		g.status = g.ResponseWriter.Status()
-	}
-
-	if g.status >= http.StatusBadRequest {
-		if !g.headerCommitted && len(g.buf) > 0 {
-			g.commitHeaders()
-			g.headerCommitted = true
-			g.ResponseWriter.Write(g.buf)
-			g.buf = g.buf[:0]
-		}
-		g.headerCommitted = true
-		return g.ResponseWriter.Write(data)
-	}
-
-	dataLen := len(data)
-	g.written += int64(dataLen)
-
-	if !g.headerCommitted {
-		g.buf = append(g.buf, data...)
-
-		if len(g.buf) >= g.minLength {
-			if g.ResponseWriter.Header().Get("Content-Encoding") != "" {
-				g.shouldCompress = false
-				g.commitHeaders()
-				g.headerCommitted = true
-				_, err := g.ResponseWriter.Write(g.buf)
-				g.buf = g.buf[:0]
-				if err != nil {
-					return 0, err
-				}
-				return dataLen, nil
-			}
-
-			if len(g.buf) >= 2 && g.buf[0] == 0x1f && g.buf[1] == 0x8b {
-				g.shouldCompress = false
-				g.commitHeaders()
-				g.headerCommitted = true
-				_, err := g.ResponseWriter.Write(g.buf)
-				g.buf = g.buf[:0]
-				if err != nil {
-					return 0, err
-				}
-				return dataLen, nil
-			}
-
-			g.shouldCompress = true
-			g.Header().Set("Content-Encoding", "gzip")
-			g.Header().Del("Content-Length")
-			g.commitHeaders()
-			g.headerCommitted = true
-
-			if _, err := g.writer.Write(g.buf); err != nil {
-				return 0, err
-			}
-			g.buf = g.buf[:0]
-			return dataLen, nil
-		}
-
-		return dataLen, nil
-	}
-
-	if !g.shouldCompress {
-		return g.ResponseWriter.Write(data)
-	}
-	return g.writer.Write(data)
-}
-
-func (g *gzipWriter) WriteString(s string) (int, error) {
-	return g.Write([]byte(s))
-}
-
-func (g *gzipWriter) Status() int {
-	if g.statusWritten {
-		return g.status
-	}
-	return g.ResponseWriter.Status()
-}
-
-func (g *gzipWriter) Size() int {
-	return int(g.written)
-}
-
-func (g *gzipWriter) Written() bool {
-	return g.ResponseWriter.Written()
-}
-
-func (g *gzipWriter) WriteHeaderNow() {
-}
-
-func (g *gzipWriter) WriteHeader(code int) {
-	g.status = code
-	g.statusWritten = true
-	g.ResponseWriter.WriteHeader(code)
-}
-
-func (g *gzipWriter) flush() {
-	if !g.headerCommitted {
-		g.headerCommitted = true
-
-		if g.status >= http.StatusBadRequest {
-			g.commitHeaders()
-			if len(g.buf) > 0 {
-				_, _ = g.ResponseWriter.Write(g.buf)
-				g.buf = g.buf[:0]
-			}
-			return
-		}
-
-		g.commitHeaders()
-		if len(g.buf) > 0 {
-			if g.ResponseWriter.Header().Get("Content-Encoding") == "" {
-				if len(g.buf) >= 2 && g.buf[0] == 0x1f && g.buf[1] == 0x8b {
-					g.ResponseWriter.Header().Set("Content-Encoding", "gzip")
-				}
-			}
-			_, _ = g.ResponseWriter.Write(g.buf)
-			g.buf = g.buf[:0]
-		}
-		return
-	}
-
-	if g.shouldCompress && !g.gzClosed {
-		_ = g.writer.Close()
-		g.gzClosed = true
-	}
-}
-
-func (g *gzipWriter) Flush() {
-	if g.headerCommitted && g.shouldCompress {
-		_ = g.writer.Flush()
-	}
-	g.ResponseWriter.Flush()
-}
-
+// excludedPaths is a list of path prefixes to skip compression for.
 type excludedPaths []string
 
 func newExcludedPaths(paths []string) excludedPaths {
 	return excludedPaths(paths)
 }
 
+// Contains returns true if the given path matches any excluded prefix.
 func (e excludedPaths) Contains(path string) bool {
 	for _, p := range e {
 		if strings.HasPrefix(path, p) {
@@ -350,6 +359,7 @@ func (e excludedPaths) Contains(path string) bool {
 	return false
 }
 
+// excludedExtensions is a set of file extensions (e.g. ".png") to skip compression for.
 type excludedExtensions map[string]struct{}
 
 func newExcludedExtensions(exts []string) excludedExtensions {
@@ -360,22 +370,8 @@ func newExcludedExtensions(exts []string) excludedExtensions {
 	return res
 }
 
+// Contains returns true if the given extension is in the exclusion set.
 func (e excludedExtensions) Contains(ext string) bool {
 	_, ok := e[ext]
 	return ok
-}
-
-func removeVaryValue(h http.Header, value string) {
-	vals := h.Values("Vary")
-	remaining := vals[:0]
-	for _, v := range vals {
-		if !strings.EqualFold(v, value) {
-			remaining = append(remaining, v)
-		}
-	}
-	if len(remaining) > 0 {
-		h["Vary"] = remaining
-	} else {
-		h.Del("Vary")
-	}
 }
