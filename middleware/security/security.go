@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// Config 安全头中间件配置。
 type Config struct {
 	Skipper func(*gin.Context) bool
 
@@ -22,7 +23,7 @@ type Config struct {
 	PermissionsPolicy     string
 }
 
-// headerEntry 存储预计算的 canonical key 与对应值，避免每次请求重复规范化。
+// headerEntry 预计算的安全头 canonical key 与值。
 type headerEntry struct {
 	key   string // textproto.CanonicalMIMEHeaderKey 预计算结果
 	value string
@@ -35,7 +36,7 @@ type securityHeaders struct {
 }
 
 func New(cfg Config) gin.HandlerFunc {
-	// 校验所有 header 值，防止 HTTP Header Injection
+	// 校验头值，防止 HTTP Header Injection
 	validateHeaderValue(cfg.XFrameOptions)
 	validateHeaderValue(cfg.XContentTypeOptions)
 	validateHeaderValue(cfg.CSP)
@@ -62,7 +63,7 @@ func New(cfg Config) gin.HandlerFunc {
 		hstsValue = b.String()
 	}
 
-	// 按固定顺序构建非空 header 列表，key 在初始化时规范化一次。
+	// 按固定顺序构建非空头列表
 	type rawEntry struct{ key, value string }
 	candidates := []rawEntry{
 		{"X-Frame-Options", cfg.XFrameOptions},
@@ -98,8 +99,7 @@ func (h *securityHeaders) handle(c *gin.Context) {
 		return
 	}
 
-	// 直接写底层 http.Header map，key 已预计算为 canonical 形式，
-	// 绕过 gin c.Header() 内部的 textproto.CanonicalMIMEHeaderKey 调用。
+	// 直接写入底层 http.Header map，key 已预计算为 canonical 形式
 	hdr := c.Writer.Header()
 	for i := range h.headers {
 		hdr[h.headers[i].key] = []string{h.headers[i].value}
@@ -144,7 +144,7 @@ func LaxConfig() Config {
 	}
 }
 
-// validateHeaderValue 校验 header 值不包含 CR/LF，防止 HTTP Header Injection。
+// validateHeaderValue 校验头值不包含 CR/LF，防止 HTTP Header Injection。
 func validateHeaderValue(v string) {
 	if strings.ContainsAny(v, "\r\n") {
 		panic("security: header value contains invalid characters (CR/LF)")

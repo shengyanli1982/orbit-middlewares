@@ -8,12 +8,15 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
+// JWTAuthConfig JWT 认证配置。
 type JWTAuthConfig struct {
 	Skipper func(*gin.Context) bool
 	Secret  []byte
 	KeyFunc jwt.Keyfunc
 }
 
+// JWTAuth 返回 JWT 认证中间件。
+// 验证通过后将 claims 存入 context，键为 jwt_claims。
 func JWTAuth(cfg JWTAuthConfig) gin.HandlerFunc {
 	keyFunc := cfg.KeyFunc
 	secret := cfg.Secret
