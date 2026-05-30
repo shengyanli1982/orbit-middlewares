@@ -19,6 +19,8 @@ const (
 	NoCompression      = gzip.NoCompression
 )
 
+const maxBufCap = 65536
+
 type Config struct {
 	Skipper          func(*gin.Context) bool
 	ExcludedPaths    []string
@@ -27,7 +29,6 @@ type Config struct {
 	CompressionLevel int
 }
 
-// countingWriter 包装 io.Writer，统计实际写入字节数（即压缩后大小）。
 type countingWriter struct {
 	w       io.Writer
 	written int64
@@ -41,15 +42,17 @@ func (cw *countingWriter) Write(p []byte) (int, error) {
 
 type gzipWriter struct {
 	gin.ResponseWriter
-	writer            *gzip.Writer
-	counter           *countingWriter // 统计压缩后实际写入字节数
-	level             int
-	statusWritten     bool
-	status            int
-	minLength         int
-	shouldCompress    bool
-	written           int64 // 原始数据大小（用于 minLength 判断）
-	contentLenChecked bool
+	writer          *gzip.Writer
+	counter         *countingWriter
+	level           int
+	statusWritten   bool
+	status          int
+	minLength       int
+	shouldCompress  bool
+	written         int64
+	headerCommitted bool
+	buf             []byte
+	gzClosed        bool
 }
 
 var gzipPool = sync.Pool{
@@ -63,7 +66,6 @@ var gzipPool = sync.Pool{
 	},
 }
 
-// DefaultConfig 返回合理的默认配置。
 func DefaultConfig() Config {
 	return Config{
 		MinLength:        1024,
@@ -81,7 +83,6 @@ func New(cfg Config) gin.HandlerFunc {
 	if level == 0 {
 		level = DefaultCompression
 	}
-	// 校验 CompressionLevel 范围：gzip 支持 -2 (HuffmanOnly) 到 9 (BestCompression)
 	if level < -2 || level > 9 {
 		panic("compression: CompressionLevel must be between -2 and 9")
 	}
@@ -103,7 +104,6 @@ func New(cfg Config) gin.HandlerFunc {
 		gz := gzipPool.Get().(*gzipWriter)
 		gz.ResponseWriter = c.Writer
 
-		// 重置 counter，指向底层 ResponseWriter
 		gz.counter.w = c.Writer
 		gz.counter.written = 0
 
@@ -126,38 +126,49 @@ func New(cfg Config) gin.HandlerFunc {
 		gz.shouldCompress = false
 		gz.statusWritten = false
 		gz.status = http.StatusOK
-		gz.contentLenChecked = false
+		gz.headerCommitted = false
+		gz.gzClosed = false
+		gz.buf = gz.buf[:0]
+		if cap(gz.buf) < minLength {
+			gz.buf = make([]byte, 0, minLength)
+		}
 
 		c.Writer = gz
 
-		c.Header("Content-Encoding", "gzip")
 		c.Writer.Header().Add("Vary", "Accept-Encoding")
 
 		c.Next()
 
-		if etag := c.Writer.Header().Get("ETag"); etag != "" && !strings.HasPrefix(etag, "W/") {
-			c.Writer.Header().Set("ETag", "W/"+etag)
-		}
+		gz.flush()
 
-		// Close gzip writer，将剩余缓冲数据刷入底层 writer
-		_ = gz.writer.Close()
+		c.Writer = gz.ResponseWriter
+
+		// ETag weakening is now handled inside commitHeaders() before header commit
 
 		switch {
 		case gz.status >= http.StatusBadRequest:
-			c.Writer.Header().Del("Content-Encoding")
-			removeVaryValue(c.Writer.Header(), "Accept-Encoding")
+			if !gz.headerCommitted {
+				c.Writer.Header().Del("Content-Encoding")
+				c.Writer.Header().Del("Content-Length")
+				removeVaryValue(c.Writer.Header(), "Accept-Encoding")
+			}
 		case !gz.shouldCompress:
 			c.Writer.Header().Del("Content-Encoding")
+			c.Writer.Header().Del("Content-Length")
 			removeVaryValue(c.Writer.Header(), "Accept-Encoding")
+			if len(gz.buf) > 0 {
+				_, _ = gz.ResponseWriter.Write(gz.buf)
+			}
 		case gz.counter.written > 0:
-			// 使用压缩后实际写入字节数设置 Content-Length
 			c.Writer.Header().Set("Content-Length", strconv.FormatInt(gz.counter.written, 10))
 		}
 
-		// 重置 writer 到 Discard，避免持有对 ResponseWriter 的引用
 		gz.writer.Reset(io.Discard)
 		gz.counter.w = io.Discard
 		gz.ResponseWriter = nil
+		if cap(gz.buf) > maxBufCap {
+			gz.buf = nil
+		}
 		gzipPool.Put(gz)
 	}
 }
@@ -178,63 +189,86 @@ func shouldCompress(req *http.Request, paths excludedPaths, exts excludedExtensi
 	return true
 }
 
+func (g *gzipWriter) commitHeaders() {
+	if etag := g.ResponseWriter.Header().Get("ETag"); etag != "" {
+		if !strings.HasPrefix(etag, "W/") {
+			g.ResponseWriter.Header().Set("ETag", "W/"+etag)
+		}
+	}
+	g.ResponseWriter.WriteHeader(g.status)
+	g.ResponseWriter.WriteHeaderNow()
+}
+
 func (g *gzipWriter) Write(data []byte) (int, error) {
 	if !g.statusWritten {
 		g.status = g.ResponseWriter.Status()
 	}
 
 	if g.status >= http.StatusBadRequest {
-		return g.ResponseWriter.Write(data)
-	}
-
-	if len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b {
-		g.shouldCompress = false
-		return g.ResponseWriter.Write(data)
-	}
-
-	g.written += int64(len(data))
-
-	if !g.contentLenChecked {
-		g.contentLenChecked = true
-		if contentLen := g.Header().Get("Content-Length"); contentLen != "" {
-			if n, err := strconv.Atoi(contentLen); err == nil {
-				if n < g.minLength {
-					g.shouldCompress = false
-					g.Header().Del("Content-Encoding")
-					return g.ResponseWriter.Write(data)
-				}
-				g.shouldCompress = true
-				g.Header().Del("Content-Length")
-			}
+		if !g.headerCommitted && len(g.buf) > 0 {
+			g.commitHeaders()
+			g.headerCommitted = true
+			g.ResponseWriter.Write(g.buf)
+			g.buf = g.buf[:0]
 		}
-	}
-
-	if !g.shouldCompress && int64(len(data)) >= int64(g.minLength) {
-		g.shouldCompress = true
-	} else if !g.shouldCompress {
-		g.Header().Del("Content-Encoding")
+		g.headerCommitted = true
 		return g.ResponseWriter.Write(data)
 	}
 
-	n, err := g.writer.Write(data)
-	return n, err
+	dataLen := len(data)
+	g.written += int64(dataLen)
+
+	if !g.headerCommitted {
+		g.buf = append(g.buf, data...)
+
+		if len(g.buf) >= g.minLength {
+			if g.ResponseWriter.Header().Get("Content-Encoding") != "" {
+				g.shouldCompress = false
+				g.commitHeaders()
+				g.headerCommitted = true
+				_, err := g.ResponseWriter.Write(g.buf)
+				g.buf = g.buf[:0]
+				if err != nil {
+					return 0, err
+				}
+				return dataLen, nil
+			}
+
+			if len(g.buf) >= 2 && g.buf[0] == 0x1f && g.buf[1] == 0x8b {
+				g.shouldCompress = false
+				g.commitHeaders()
+				g.headerCommitted = true
+				_, err := g.ResponseWriter.Write(g.buf)
+				g.buf = g.buf[:0]
+				if err != nil {
+					return 0, err
+				}
+				return dataLen, nil
+			}
+
+			g.shouldCompress = true
+			g.Header().Set("Content-Encoding", "gzip")
+			g.Header().Del("Content-Length")
+			g.commitHeaders()
+			g.headerCommitted = true
+
+			if _, err := g.writer.Write(g.buf); err != nil {
+				return 0, err
+			}
+			g.buf = g.buf[:0]
+			return dataLen, nil
+		}
+
+		return dataLen, nil
+	}
+
+	if !g.shouldCompress {
+		return g.ResponseWriter.Write(data)
+	}
+	return g.writer.Write(data)
 }
 
 func (g *gzipWriter) WriteString(s string) (int, error) {
-	// 直接走压缩路径的快速判断，避免 string→[]byte 转换
-	if !g.statusWritten {
-		g.status = g.ResponseWriter.Status()
-	}
-	if g.status >= http.StatusBadRequest {
-		return g.ResponseWriter.WriteString(s)
-	}
-	// 已确认需要压缩，直接写入 gzip writer，避免 []byte 转换 alloc。
-	// 同步更新 g.written，保证 Size() 返回值与 Write 路径一致。
-	if g.shouldCompress {
-		g.written += int64(len(s))
-		return io.WriteString(g.writer, s)
-	}
-	// 尚未决策，回退到通用 Write 路径（含 minLength 判断）
 	return g.Write([]byte(s))
 }
 
@@ -254,7 +288,6 @@ func (g *gzipWriter) Written() bool {
 }
 
 func (g *gzipWriter) WriteHeaderNow() {
-	g.ResponseWriter.WriteHeaderNow()
 }
 
 func (g *gzipWriter) WriteHeader(code int) {
@@ -263,8 +296,42 @@ func (g *gzipWriter) WriteHeader(code int) {
 	g.ResponseWriter.WriteHeader(code)
 }
 
+func (g *gzipWriter) flush() {
+	if !g.headerCommitted {
+		g.headerCommitted = true
+
+		if g.status >= http.StatusBadRequest {
+			g.commitHeaders()
+			if len(g.buf) > 0 {
+				_, _ = g.ResponseWriter.Write(g.buf)
+				g.buf = g.buf[:0]
+			}
+			return
+		}
+
+		g.commitHeaders()
+		if len(g.buf) > 0 {
+			if g.ResponseWriter.Header().Get("Content-Encoding") == "" {
+				if len(g.buf) >= 2 && g.buf[0] == 0x1f && g.buf[1] == 0x8b {
+					g.ResponseWriter.Header().Set("Content-Encoding", "gzip")
+				}
+			}
+			_, _ = g.ResponseWriter.Write(g.buf)
+			g.buf = g.buf[:0]
+		}
+		return
+	}
+
+	if g.shouldCompress && !g.gzClosed {
+		_ = g.writer.Close()
+		g.gzClosed = true
+	}
+}
+
 func (g *gzipWriter) Flush() {
-	_ = g.writer.Flush()
+	if g.headerCommitted && g.shouldCompress {
+		_ = g.writer.Flush()
+	}
 	g.ResponseWriter.Flush()
 }
 

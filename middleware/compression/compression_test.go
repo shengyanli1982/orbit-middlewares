@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -309,4 +310,83 @@ func TestCompression_VaryHeader(t *testing.T) {
 
 	vary := w.Header().Get("Vary")
 	assert.Contains(t, vary, "Accept-Encoding")
+}
+
+// TestCompression_RealHTTP_SmallJSON_NoFalseGzipHeader 回归测试：
+// 使用真实 HTTP server 验证小 JSON 响应不会携带 Content-Encoding: gzip 但 body 未压缩。
+// httptest.NewRecorder 不会 commit headers 到 wire，无法暴露 handlerHeader.Clone() 后无法修改的 bug。
+func TestCompression_RealHTTP_SmallJSON_NoFalseGzipHeader(t *testing.T) {
+	r := gin.New()
+	r.Use(New(Config{
+		MinLength: 1024,
+	}))
+	r.POST("/test", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"errorCode":    0,
+			"errorMessage": "success",
+			"data":         gin.H{"count": 42},
+		})
+	})
+
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			DisableCompression: true,
+		},
+	}
+
+	resp, err := client.Post(srv.URL+"/test", "application/json", bytes.NewReader([]byte("{}")))
+	assert.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Empty(t, resp.Header.Get("Content-Encoding"),
+		"small JSON response should NOT have Content-Encoding: gzip")
+
+	body, err := io.ReadAll(resp.Body)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, body)
+	assert.Contains(t, string(body), "success")
+}
+
+// TestCompression_RealHTTP_LargeJSON_GzipEncoded 验证大响应确实被压缩
+func TestCompression_RealHTTP_LargeJSON_GzipEncoded(t *testing.T) {
+	r := gin.New()
+	r.Use(New(Config{
+		MinLength: 100,
+	}))
+	r.GET("/test", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"errorCode":    0,
+			"errorMessage": "success",
+			"data":         strings.Repeat("x", 2000),
+		})
+	})
+
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			DisableCompression: true,
+		},
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/test", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	resp, err := client.Do(req)
+	assert.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "gzip", resp.Header.Get("Content-Encoding"))
+
+	gr, err := gzip.NewReader(resp.Body)
+	assert.NoError(t, err)
+	defer gr.Close()
+	body, err := io.ReadAll(gr)
+	assert.NoError(t, err)
+	assert.Contains(t, string(body), "success")
 }
