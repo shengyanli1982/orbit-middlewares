@@ -12,18 +12,22 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// Mode 限流模式。
 type Mode int
 
 const (
+	// ModeGlobal 全局共享限流器。
 	ModeGlobal Mode = iota
+	// ModeIP 按 IP 独立限流。
 	ModeIP
 )
 
 const (
-	// numShards 分片数量，使用 256 个分片
+	// numShards 分片数量。
 	numShards = 256
 )
 
+// Config 限流中间件配置。
 type Config struct {
 	Skipper     func(*gin.Context) bool
 	Mode        Mode
@@ -46,8 +50,8 @@ type limiter struct {
 	stopOnce sync.Once
 }
 
-// New 创建限流中间件，返回 (handler, stop) 元组。
-// stop 函数用于停止后台清理 goroutine，调用方应在不再需要时调用。
+// New 创建限流中间件，返回 (handler, stop)。
+// stop 用于停止后台清理 goroutine，应在不再需要时调用。
 func New(cfg Config) (gin.HandlerFunc, func()) {
 	if cfg.IPExtractor == nil {
 		cfg.IPExtractor = func(c *gin.Context) string {
@@ -77,7 +81,7 @@ func New(cfg Config) (gin.HandlerFunc, func()) {
 
 		if cfg.Mode == ModeGlobal {
 			r := l.global.Reserve()
-			// Reserve OK() == false: 请求的 token 数超过了 burst 上限（非常罕见）
+			// Reserve OK 为 false：请求超过 burst 上限
 			if !r.OK() {
 				c.Header("X-RateLimit-Limit", strconv.Itoa(int(math.Ceil(cfg.QPS))))
 				c.Header("Retry-After", "0")
@@ -85,7 +89,7 @@ func New(cfg Config) (gin.HandlerFunc, func()) {
 				c.Abort()
 				return
 			}
-			// Reserve Delay() > 0: bucket 中当前没有可用 token，需要等待补充
+			// Reserve Delay > 0：当前无可用 token
 			if r.Delay() > 0 {
 				r.Cancel()
 				c.Header("X-RateLimit-Limit", strconv.Itoa(int(math.Ceil(cfg.QPS))))
@@ -102,7 +106,7 @@ func New(cfg Config) (gin.HandlerFunc, func()) {
 			}
 
 			ok, delay, r := l.allowIP(key)
-			// Reserve OK() == false: 请求的 token 数超过了 burst 上限（非常罕见）
+			// Reserve OK 为 false：请求超过 burst 上限
 			if !ok {
 				c.Header("X-RateLimit-Limit", strconv.Itoa(int(math.Ceil(cfg.QPS))))
 				c.Header("Retry-After", "0")
@@ -110,7 +114,7 @@ func New(cfg Config) (gin.HandlerFunc, func()) {
 				c.Abort()
 				return
 			}
-			// Reserve Delay() > 0: bucket 中没有可用 token，需要等待补充
+			// Reserve Delay > 0：当前无可用 token
 			if delay > 0 {
 				r.Cancel()
 				c.Header("X-RateLimit-Limit", strconv.Itoa(int(math.Ceil(cfg.QPS))))
@@ -127,8 +131,7 @@ func New(cfg Config) (gin.HandlerFunc, func()) {
 	return handler, l.Stop
 }
 
-// getShardIndex 对 IP 字符串使用内联 FNV-1a hash 取模 256。
-// 内联计算避免 fnv.New32a() 的堆分配，每次调用节省 1 alloc。
+// getShardIndex 使用 FNV-1a hash 计算 IP 的分片索引。
 func getShardIndex(ipStr string) int {
 	const (
 		fnvOffset32 uint32 = 2166136261
@@ -142,11 +145,8 @@ func getShardIndex(ipStr string) int {
 	return int(h) % numShards
 }
 
-// allowIP 检查并更新IP的限流状态
-// 返回值: (是否可放行, 等待时间, Reservation)
-//   - ok=false: 请求的 token 数超过了 burst 上限（非常罕见）
-//   - delay>0: bucket 中没有可用 token，需要等待
-//   - delay==0 && ok==true: 可以立即放行
+// allowIP 检查并更新 IP 的限流状态。
+// 返回：(是否放行, 等待时间, Reservation)
 func (l *limiter) allowIP(ipStr string) (bool, time.Duration, *rate.Reservation) {
 	now := time.Now()
 	shardIdx := getShardIndex(ipStr)
@@ -161,8 +161,7 @@ func (l *limiter) allowIP(ipStr string) (bool, time.Duration, *rate.Reservation)
 		return true, r.Delay(), r
 	}
 
-	// 使用 LoadOrStore 避免并发场景下重复创建 limiter。
-	// 若两个 goroutine 同时到达此处，只有一个能成功 Store，另一个使用已存储的值。
+	// LoadOrStore 避免并发场景下重复创建 limiter。
 	newIL := &ipLimiter{
 		limiter: rate.NewLimiter(rate.Limit(l.cfg.QPS), l.cfg.Burst),
 	}
@@ -170,7 +169,7 @@ func (l *limiter) allowIP(ipStr string) (bool, time.Duration, *rate.Reservation)
 	actual, loaded := l.shards[shardIdx].LoadOrStore(ipStr, newIL)
 	il := actual.(*ipLimiter)
 	if loaded {
-		// 另一个 goroutine 已存储，更新 lastSeen 并使用已有 limiter
+		// 已被其他 goroutine 存储，更新 lastSeen 并使用已有 limiter
 		il.lastSeen.Store(now.UnixNano())
 	}
 	r := il.limiter.Reserve()

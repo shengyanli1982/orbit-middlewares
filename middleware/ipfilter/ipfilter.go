@@ -8,13 +8,14 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// Config IP 过滤器配置。
 type Config struct {
 	Skipper    func(*gin.Context) bool
 	AllowedIPs []string
 	BlockedIPs []string
 }
 
-// ipSet 存储精确 IP（O(1) 查找）和 CIDR 网段列表
+// ipSet 存储精确 IP（O(1) 查找）和 CIDR 网段列表。
 type ipSet struct {
 	exactIPs map[string]struct{}
 	cidrNets []*net.IPNet

@@ -1,11 +1,11 @@
-// Package compression implements gzip compression middleware for Gin.
+// Package compression 实现 Gin 的 gzip 压缩中间件。
 //
-// Design (inspired by gin-contrib/gzip):
-//   - Content-Encoding: gzip is set EAGERLY before c.Next() as a HINT to the client.
-//   - The compression decision is LAZY: body data is buffered until MinLength is reached.
-//   - If body < MinLength, headers are never committed, so we can safely strip the hint.
-//   - Error responses (4xx/5xx) bypass compression entirely (no double-gzip risk).
-//   - Already-compressed responses (e.g. handler set Content-Encoding: gzip) are passed through.
+// 设计思路：
+//   - Content-Encoding: gzip 在 c.Next() 前预先设置，作为提示
+//   - 延迟决策：请求体先缓冲，达到 MinLength 后再决定是否压缩
+//   - 请求体小于 MinLength 时，不提交响应头，可安全移除提示
+//   - 错误响应（4xx/5xx）不压缩
+//   - 已压缩的内容直接透传
 package compression
 
 import (
@@ -38,7 +38,7 @@ const (
 	gzipEncoding          = "gzip"
 )
 
-// Config holds middleware configuration.
+// Config 压缩中间件配置。
 type Config struct {
 	Skipper          func(*gin.Context) bool
 	ExcludedPaths    []string
@@ -47,7 +47,7 @@ type Config struct {
 	CompressionLevel int
 }
 
-// DefaultConfig returns sensible defaults.
+// DefaultConfig 返回默认配置。
 func DefaultConfig() Config {
 	return Config{
 		MinLength:        1024,
@@ -55,8 +55,7 @@ func DefaultConfig() Config {
 	}
 }
 
-// countingWriter wraps an io.Writer and tracks the number of bytes written through it.
-// Used to measure compressed output size (for accurate Content-Length).
+// countingWriter 统计写入字节数，用于更新 Content-Length。
 type countingWriter struct {
 	w       io.Writer
 	written int64
@@ -68,7 +67,7 @@ func (cw *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// gzipWriter wraps gin.ResponseWriter and buffers body data before deciding to compress.
+// gzipWriter 包装 ResponseWriter，缓冲请求体后决定是否压缩。
 type gzipWriter struct {
 	gin.ResponseWriter
 	writer        *gzip.Writer
@@ -86,38 +85,37 @@ func (g *gzipWriter) WriteString(s string) (int, error) {
 	return g.Write([]byte(s))
 }
 
-// Write implements io.Writer. The strategy:
-//  1. Status >= 400 (error response): pass through uncompressed, remove gzip headers.
-//  2. Already-compressed upstream (Content-Encoding != gzip): pass through, remove gzip headers.
-//  3. Already-compressed upstream (Content-Encoding == gzip with gzip magic): pass through.
-//  4. Content-Length header present: use it as a fast-path decision (no buffering).
-//  5. Otherwise: buffer data. Once buf >= minWidth, mark shouldCompress=true and flush buf+zlib.
+// Write 实现 io.Writer。策略：
+//  1. 错误响应：不压缩，透传并移除 gzip 头
+//  2. 上游已使用非 gzip 编码：透传，移除 gzip 头
+//  3. 上游已使用 gzip 编码：直接透传
+//  4. 存在 Content-Length：根据长度快速决策，不缓冲
+//  5. 其他情况：缓冲数据，达到阈值后标记压缩
 func (g *gzipWriter) Write(data []byte) (int, error) {
 	if !g.statusWritten {
 		g.status = g.ResponseWriter.Status()
 	}
 
-	// Error responses: don't compress, pass through
+	// 错误响应，不压缩
 	if g.status >= http.StatusBadRequest {
 		g.removeGzipHeaders()
 		return g.ResponseWriter.Write(data)
 	}
 
-	// Check if response is already compressed by upstream
+	// 检查上游是否已压缩
 	if ce := g.Header().Get(headerContentEncoding); ce != "" && ce != gzipEncoding {
-		// Different encoding (e.g. br, deflate): pass through, remove our gzip headers
+	// 其他编码（如 br、deflate）：透传，移除 gzip 头
 		g.removeGzipHeaders()
 		return g.ResponseWriter.Write(data)
 	} else if ce == gzipEncoding {
-		// Handler already set gzip: if the data is actual gzip, pass through AS-IS
-		// (don't remove the handler's CE: gzip, just skip double-compression)
+		// 上游已设置 gzip：若数据确实是 gzip 格式，直接透传
 		if len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b {
 			return g.ResponseWriter.Write(data)
 		}
-		// Data doesn't look like gzip despite CE: gzip - fall through to try compressing
+		// 已设置 gzip 但数据不匹配，继续尝试压缩
 	}
 
-	// Use Content-Length as fast-path decision (no need to buffer when we know the size)
+	// 根据 Content-Length 快速决策
 	if clStr := g.Header().Get("Content-Length"); clStr != "" {
 		if cl, err := strconv.Atoi(clStr); err == nil {
 			if cl < g.minLength {
@@ -128,27 +126,24 @@ func (g *gzipWriter) Write(data []byte) (int, error) {
 		}
 	}
 
-	// Decide via buffering
+	// 通过缓冲决定
 	if !g.shouldCompress {
 		if len(data) >= g.minLength {
-			// Single write exceeds threshold: compress
+			// 单次写入超阈值，开始压缩
 			g.shouldCompress = true
 		} else {
-			// Buffer and wait for threshold
+			// 缓冲，等待达到阈值
 			n, err := g.buf.Write(data)
 			if err != nil || g.buf.Len() < g.minLength {
 				return n, err
 			}
-			// Threshold reached: compress everything buffered
+			// 达到阈值，压缩所有缓冲数据
 			g.shouldCompress = true
 			data = g.buf.Bytes()
 		}
 	}
 
-	// COMMIT POINT: we are about to write compressed data. The gzip.Writer's Write
-	// will flow through to the underlying gin.ResponseWriter.Write, which internally
-	// calls WriteHeaderNow() and commits headers. Weaken ETag before this happens
-	// so the header map contains the weak version when committed.
+	// 提交点：即将写入压缩数据，提前弱化 ETag
 	if etag := g.Header().Get("ETag"); etag != "" && !strings.HasPrefix(etag, "W/") {
 		g.Header().Set("ETag", "W/"+etag)
 	}
@@ -156,7 +151,7 @@ func (g *gzipWriter) Write(data []byte) (int, error) {
 	return g.writer.Write(data)
 }
 
-// Status returns the current HTTP status code (explicitly set or underlying).
+// Status 返回当前 HTTP 状态码。
 func (g *gzipWriter) Status() int {
 	if g.statusWritten {
 		return g.status
@@ -164,36 +159,29 @@ func (g *gzipWriter) Status() int {
 	return g.ResponseWriter.Status()
 }
 
-// Size returns bytes written to the underlying writer (uncompressed size).
+// Size 返回已写入的字节数。
 func (g *gzipWriter) Size() int {
 	return g.ResponseWriter.Size()
 }
 
-// Written returns true if the response body was already written.
+// Written 返回是否已写入响应体。
 func (g *gzipWriter) Written() bool {
 	return g.ResponseWriter.Written()
 }
 
-// WriteHeaderNow delegates to the underlying writer.
-// Note: This commits headers to the HTTP connection. If body is buffered but not
-// yet compressed, the caller should be aware the headers include Content-Encoding
-// (which can still be modified until the HTTP flush after handler returns).
+// WriteHeaderNow 提交响应头。
 func (g *gzipWriter) WriteHeaderNow() {
 	g.ResponseWriter.WriteHeaderNow()
 }
 
-// WriteHeader records the status code and updates the underlying writer's status,
-// but does NOT commit headers. This allows ETag weakening and other header mutations
-// to occur in deferred cleanup after the handler finishes (gin-contrib/gzip pattern).
-// In gin, WriteHeader only updates an internal status field; actual header commitment
-// happens later in WriteHeaderNow() which is called from Write().
+// WriteHeader 记录状态码，不提交响应头。提交由 WriteHeaderNow 完成。
 func (g *gzipWriter) WriteHeader(code int) {
 	g.status = code
 	g.statusWritten = true
 	g.ResponseWriter.WriteHeader(code) // Only updates underlying status, doesn't commit
 }
 
-// Flush flushes the gzip writer (if compressing) then the underlying writer.
+// Flush 刷新 gzip writer 和底层 writer。
 func (g *gzipWriter) Flush() {
 	if g.shouldCompress {
 		_ = g.writer.Flush()
@@ -201,20 +189,19 @@ func (g *gzipWriter) Flush() {
 	g.ResponseWriter.Flush()
 }
 
-// Hijack implements http.Hijacker by delegating.
+// Hijack 实现 http.Hijacker，用于 WebSocket 等场景。
 func (g *gzipWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return g.ResponseWriter.Hijack()
 }
 
-// removeGzipHeaders removes all compression-related headers.
-// Safe to call only before headers are committed (before first Write to underlying writer).
+// removeGzipHeaders 移除所有压缩相关头，仅在响应头未提交前调用。
 func (g *gzipWriter) removeGzipHeaders() {
 	g.Header().Del(headerContentEncoding)
 	g.Header().Del(headerVary)
 	g.Header().Del("ETag")
 }
 
-// gzipPool manages a pool of gzip.Writer + countingWriter pairs.
+// gzBundle 用于对象池复用的 gzip writer 和计数器。
 type gzBundle struct {
 	gz      *gzip.Writer
 	counter *countingWriter
@@ -228,7 +215,7 @@ var gzipPool = sync.Pool{
 	},
 }
 
-// New creates the compression middleware handler.
+// New 创建压缩中间件。
 func New(cfg Config) gin.HandlerFunc {
 	minLength := cfg.MinLength
 	if minLength <= 0 {
@@ -259,7 +246,7 @@ func New(cfg Config) gin.HandlerFunc {
 
 		bundle := gzipPool.Get().(*gzBundle)
 
-		// Reset gzip writer to output to the ResponseWriter (via countingWriter)
+		// 重置 gzip writer 输出到 ResponseWriter
 		bundle.counter.w = c.Writer
 		bundle.counter.written = 0
 		if bundle.gz == nil {
@@ -268,9 +255,7 @@ func New(cfg Config) gin.HandlerFunc {
 			bundle.gz.Reset(bundle.counter)
 		}
 
-		// EAGER: set Content-Encoding as a HINT. If body ends up small or status
-		// is >= 400, we'll strip these headers in deferred cleanup (which runs
-		// BEFORE Go's http server flushes headers to wire).
+		// 预先设置 Content-Encoding，若最终不压缩则在 defer 中移除
 		c.Header(headerContentEncoding, gzipEncoding)
 		c.Writer.Header().Add(headerVary, headerAcceptEncoding)
 
@@ -286,14 +271,12 @@ func New(cfg Config) gin.HandlerFunc {
 		defer func() {
 			switch {
 			case gw.status >= http.StatusBadRequest:
-				// Error response: strip compression headers, reset gzip
+				// 错误响应：移除压缩头
 				gw.removeGzipHeaders()
 				bundle.gz.Reset(io.Discard)
 
 			case !gw.shouldCompress:
-				// Body was too small to compress. Since gw.Write only buffered (never
-				// wrote to the underlying writer), headers have NOT been committed.
-				// Safe to strip the Content-Encoding hint.
+				// 不压缩：移除提示头，写入缓冲数据
 				gw.Header().Del(headerContentEncoding)
 				gw.Header().Del(headerVary)
 				gw.Header().Del("ETag")
@@ -301,22 +284,20 @@ func New(cfg Config) gin.HandlerFunc {
 				bundle.gz.Reset(io.Discard)
 
 			default:
-				// Compressed successfully. ETag weakening was already done in
-				// gzipWriter.Write before the first compressing write.
-				// Will Close() below to write gzip footer.
+				// 压缩成功，ETag 已在 Write 中弱化
 			}
 
-			// Close the gzip writer (writes footer if used, or no-ops if Reset'd)
+			// 关闭 gzip writer，写入尾部（若未使用则无操作）
 			_ = bundle.gz.Close()
 
-			// Set Content-Length based on actual bytes written
+			// 根据实际写入字节数设置 Content-Length
 			if gw.shouldCompress {
 				c.Header("Content-Length", strconv.FormatInt(bundle.counter.written, 10))
 			} else if gw.ResponseWriter.Size() >= 0 {
 				c.Header("Content-Length", strconv.Itoa(gw.ResponseWriter.Size()))
 			}
 
-			// Release countingWriter's reference to c.Writer (avoid keeping ResponseWriter alive)
+			// 释放引用，避免持有 c.Writer
 			bundle.counter.w = io.Discard
 			gzipPool.Put(bundle)
 		}()
@@ -325,7 +306,7 @@ func New(cfg Config) gin.HandlerFunc {
 	}
 }
 
-// shouldCompress decides whether a response should be compressed based on the request.
+// shouldCompress 判断响应是否应该压缩。
 func shouldCompress(req *http.Request, paths excludedPaths, exts excludedExtensions) bool {
 	if !strings.Contains(req.Header.Get(headerAcceptEncoding), gzipEncoding) {
 		return false
@@ -342,14 +323,14 @@ func shouldCompress(req *http.Request, paths excludedPaths, exts excludedExtensi
 	return true
 }
 
-// excludedPaths is a list of path prefixes to skip compression for.
+// excludedPaths 不压缩的路径前缀列表。
 type excludedPaths []string
 
 func newExcludedPaths(paths []string) excludedPaths {
 	return excludedPaths(paths)
 }
 
-// Contains returns true if the given path matches any excluded prefix.
+// Contains 返回是否匹配任一排除前缀。
 func (e excludedPaths) Contains(path string) bool {
 	for _, p := range e {
 		if strings.HasPrefix(path, p) {
@@ -359,7 +340,7 @@ func (e excludedPaths) Contains(path string) bool {
 	return false
 }
 
-// excludedExtensions is a set of file extensions (e.g. ".png") to skip compression for.
+// excludedExtensions 不压缩的文件扩展名集合。
 type excludedExtensions map[string]struct{}
 
 func newExcludedExtensions(exts []string) excludedExtensions {
@@ -370,7 +351,7 @@ func newExcludedExtensions(exts []string) excludedExtensions {
 	return res
 }
 
-// Contains returns true if the given extension is in the exclusion set.
+// Contains 返回是否匹配任一排除扩展名。
 func (e excludedExtensions) Contains(ext string) bool {
 	_, ok := e[ext]
 	return ok

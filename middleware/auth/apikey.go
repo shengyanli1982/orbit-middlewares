@@ -6,6 +6,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// APIKeyAuthConfig API Key 认证配置。
 type APIKeyAuthConfig struct {
 	Skipper    func(*gin.Context) bool
 	HeaderName string
@@ -14,9 +15,7 @@ type APIKeyAuthConfig struct {
 	Validator  func(key string, c *gin.Context) bool
 }
 
-// apiKeyAuth API Key认证
-// 支持从Header或Query参数获取API Key
-// 使用map存储实现O(1)查找
+// apiKeyAuth API Key 认证引擎。
 type apiKeyAuth struct {
 	skipper    func(*gin.Context) bool
 	headerName string
@@ -74,11 +73,9 @@ func APIKeyAuth(cfg APIKeyAuthConfig) gin.HandlerFunc {
 	}
 }
 
-// extractAPIKey 提取API Key
-// 优先级：Query参数 > Header
-// 返回空字符串表示未找到
+// extractAPIKey 从 Query 或 Header 提取 API Key，Query 优先。
 func extractAPIKey(c *gin.Context, headerName, queryParam string) string {
-	// 优先从Query参数获取
+	// 优先从 Query 参数获取
 	if queryParam != "" {
 		key := c.Query(queryParam)
 		if key != "" {
@@ -86,7 +83,7 @@ func extractAPIKey(c *gin.Context, headerName, queryParam string) string {
 		}
 	}
 
-	// 其次从Header获取
+	// 其次从 Header 获取
 	if headerName != "" {
 		key := c.GetHeader(headerName)
 		if key != "" {
