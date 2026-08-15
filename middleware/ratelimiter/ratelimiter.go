@@ -73,6 +73,8 @@ func New(cfg Config) (gin.HandlerFunc, func()) {
 		go l.cleanupExpired()
 	}
 
+	limitHeader := strconv.Itoa(int(math.Ceil(cfg.QPS)))
+
 	handler := func(c *gin.Context) {
 		if cfg.Skipper != nil && cfg.Skipper(c) {
 			c.Next()
@@ -80,20 +82,25 @@ func New(cfg Config) (gin.HandlerFunc, func()) {
 		}
 
 		if cfg.Mode == ModeGlobal {
+			if l.global.Allow() {
+				c.Next()
+				return
+			}
 			r := l.global.Reserve()
 			// Reserve OK 为 false：请求超过 burst 上限
 			if !r.OK() {
-				c.Header("X-RateLimit-Limit", strconv.Itoa(int(math.Ceil(cfg.QPS))))
+				c.Header("X-RateLimit-Limit", limitHeader)
 				c.Header("Retry-After", "0")
 				c.String(http.StatusTooManyRequests, "[429] rate limit exceeded")
 				c.Abort()
 				return
 			}
 			// Reserve Delay > 0：当前无可用 token
-			if r.Delay() > 0 {
-				r.Cancel()
-				c.Header("X-RateLimit-Limit", strconv.Itoa(int(math.Ceil(cfg.QPS))))
-				c.Header("Retry-After", strconv.FormatInt(int64(math.Ceil(r.Delay().Seconds())), 10))
+			delay := r.Delay()
+			r.Cancel()
+			if delay > 0 {
+				c.Header("X-RateLimit-Limit", limitHeader)
+				c.Header("Retry-After", strconv.FormatInt(int64(math.Ceil(delay.Seconds())), 10))
 				c.String(http.StatusTooManyRequests, "[429] rate limit exceeded")
 				c.Abort()
 				return
@@ -108,7 +115,7 @@ func New(cfg Config) (gin.HandlerFunc, func()) {
 			ok, delay, r := l.allowIP(key)
 			// Reserve OK 为 false：请求超过 burst 上限
 			if !ok {
-				c.Header("X-RateLimit-Limit", strconv.Itoa(int(math.Ceil(cfg.QPS))))
+				c.Header("X-RateLimit-Limit", limitHeader)
 				c.Header("Retry-After", "0")
 				c.String(http.StatusTooManyRequests, "[429] rate limit exceeded")
 				c.Abort()
@@ -117,7 +124,7 @@ func New(cfg Config) (gin.HandlerFunc, func()) {
 			// Reserve Delay > 0：当前无可用 token
 			if delay > 0 {
 				r.Cancel()
-				c.Header("X-RateLimit-Limit", strconv.Itoa(int(math.Ceil(cfg.QPS))))
+				c.Header("X-RateLimit-Limit", limitHeader)
 				c.Header("Retry-After", strconv.FormatInt(int64(math.Ceil(delay.Seconds())), 10))
 				c.String(http.StatusTooManyRequests, "[429] rate limit exceeded")
 				c.Abort()
@@ -154,6 +161,9 @@ func (l *limiter) allowIP(ipStr string) (bool, time.Duration, *rate.Reservation)
 	if v, ok := l.shards[shardIdx].Load(ipStr); ok {
 		il := v.(*ipLimiter)
 		il.lastSeen.Store(now.UnixNano())
+		if il.limiter.Allow() {
+			return true, 0, nil
+		}
 		r := il.limiter.Reserve()
 		if !r.OK() {
 			return false, 0, nil
@@ -171,6 +181,9 @@ func (l *limiter) allowIP(ipStr string) (bool, time.Duration, *rate.Reservation)
 	if loaded {
 		// 已被其他 goroutine 存储，更新 lastSeen 并使用已有 limiter
 		il.lastSeen.Store(now.UnixNano())
+	}
+	if il.limiter.Allow() {
+		return true, 0, nil
 	}
 	r := il.limiter.Reserve()
 	if !r.OK() {
