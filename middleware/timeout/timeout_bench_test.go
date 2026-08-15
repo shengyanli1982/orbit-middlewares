@@ -3,9 +3,6 @@ package timeout
 import (
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"runtime"
-	"runtime/pprof"
 	"testing"
 	"time"
 
@@ -25,14 +22,6 @@ func BenchmarkTimeout_NoTimeout(b *testing.B) {
 	router.GET("/test", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
-
-	f, err := os.Create("timeout_notimeout_cpu.prof")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer f.Close()
-	pprof.StartCPUProfile(f)
-	defer pprof.StopCPUProfile()
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -59,14 +48,6 @@ func BenchmarkTimeout_Triggered(b *testing.B) {
 		c.String(http.StatusOK, "ok")
 	})
 
-	f, err := os.Create("timeout_triggered_cpu.prof")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer f.Close()
-	pprof.StartCPUProfile(f)
-	defer pprof.StopCPUProfile()
-
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		req := httptest.NewRequest(http.MethodGet, "/test", nil)
@@ -91,19 +72,10 @@ func BenchmarkTimeout_MemAllocation(b *testing.B) {
 		c.String(http.StatusOK, "ok")
 	})
 
-	f, err := os.Create("timeout_mem.prof")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer f.Close()
-
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		req := httptest.NewRequest(http.MethodGet, "/test", nil)
 		recorder := httptest.NewRecorder()
 		router.ServeHTTP(recorder, req)
 	}
-
-	runtime.GC()
-	pprof.WriteHeapProfile(f)
 }

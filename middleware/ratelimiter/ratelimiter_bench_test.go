@@ -4,9 +4,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"runtime"
-	"runtime/pprof"
 	"testing"
 	"time"
 
@@ -29,14 +26,6 @@ func BenchmarkRateLimiter_GlobalMode(b *testing.B) {
 	router.GET("/test", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
-
-	f, err := os.Create("ratelimiter_global_cpu.prof")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer f.Close()
-	pprof.StartCPUProfile(f)
-	defer pprof.StopCPUProfile()
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -68,14 +57,6 @@ func BenchmarkRateLimiter_IPMode(b *testing.B) {
 		c.String(http.StatusOK, "ok")
 	})
 
-	f, err := os.Create("ratelimiter_ip_cpu.prof")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer f.Close()
-	pprof.StartCPUProfile(f)
-	defer pprof.StopCPUProfile()
-
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		req := httptest.NewRequest(http.MethodGet, "/test", nil)
@@ -102,14 +83,6 @@ func BenchmarkRateLimiter_IPModeManyKeys(b *testing.B) {
 	router.GET("/test", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
-
-	f, err := os.Create("ratelimiter_manykeys_cpu.prof")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer f.Close()
-	pprof.StartCPUProfile(f)
-	defer pprof.StopCPUProfile()
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -139,12 +112,6 @@ func BenchmarkRateLimiter_MemAllocation(b *testing.B) {
 		c.String(http.StatusOK, "ok")
 	})
 
-	f, err := os.Create("ratelimiter_mem.prof")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer f.Close()
-
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		req := httptest.NewRequest(http.MethodGet, "/test", nil)
@@ -152,9 +119,6 @@ func BenchmarkRateLimiter_MemAllocation(b *testing.B) {
 		recorder := httptest.NewRecorder()
 		router.ServeHTTP(recorder, req)
 	}
-
-	runtime.GC()
-	pprof.WriteHeapProfile(f)
 }
 
 func BenchmarkRateLimiter_AllowIP(b *testing.B) {
@@ -165,14 +129,6 @@ func BenchmarkRateLimiter_AllowIP(b *testing.B) {
 			TTL:   5 * time.Minute,
 		},
 	}
-
-	f, err := os.Create("ratelimiter_allowip_cpu.prof")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer f.Close()
-	pprof.StartCPUProfile(f)
-	defer pprof.StopCPUProfile()
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

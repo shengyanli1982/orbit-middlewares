@@ -3,9 +3,6 @@ package security
 import (
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"runtime"
-	"runtime/pprof"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -20,14 +17,6 @@ func BenchmarkSecurityHeaders_AllHeaders(b *testing.B) {
 	router.GET("/test", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
-
-	f, err := os.Create("security_all_headers_cpu.prof")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer f.Close()
-	pprof.StartCPUProfile(f)
-	defer pprof.StopCPUProfile()
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -52,14 +41,6 @@ func BenchmarkSecurityHeaders_MinimalHeaders(b *testing.B) {
 		c.String(http.StatusOK, "ok")
 	})
 
-	f, err := os.Create("security_minimal_cpu.prof")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer f.Close()
-	pprof.StartCPUProfile(f)
-	defer pprof.StopCPUProfile()
-
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		req := httptest.NewRequest(http.MethodGet, "/test", nil)
@@ -79,14 +60,6 @@ func BenchmarkSecurityHeaders_NoHeaders(b *testing.B) {
 	router.GET("/test", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
-
-	f, err := os.Create("security_no_headers_cpu.prof")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer f.Close()
-	pprof.StartCPUProfile(f)
-	defer pprof.StopCPUProfile()
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -145,14 +118,6 @@ func BenchmarkSecurityHeaders_HSTSFullyConfigured(b *testing.B) {
 		c.String(http.StatusOK, "ok")
 	})
 
-	f, err := os.Create("security_hsts_full_cpu.prof")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer f.Close()
-	pprof.StartCPUProfile(f)
-	defer pprof.StopCPUProfile()
-
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		req := httptest.NewRequest(http.MethodGet, "/test", nil)
@@ -173,19 +138,10 @@ func BenchmarkSecurityHeaders_MemAllocation(b *testing.B) {
 		c.String(http.StatusOK, "ok")
 	})
 
-	f, err := os.Create("security_mem.prof")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer f.Close()
-
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		req := httptest.NewRequest(http.MethodGet, "/test", nil)
 		recorder := httptest.NewRecorder()
 		router.ServeHTTP(recorder, req)
 	}
-
-	runtime.GC()
-	pprof.WriteHeapProfile(f)
 }
