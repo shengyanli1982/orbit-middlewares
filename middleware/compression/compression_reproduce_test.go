@@ -25,7 +25,7 @@ func init() {
 }
 
 var reproBytesBufferPool = sync.Pool{
-	New: func() interface{} { return &bytes.Buffer{} },
+	New: func() any { return &bytes.Buffer{} },
 }
 
 type reproResponseBodyWriter struct {
@@ -70,9 +70,9 @@ func smallJSONHandler() gin.HandlerFunc {
 			"errorCode":    0,
 			"errorMessage": "success",
 			"data": gin.H{
-				"count":      50,
+				"count":        50,
 				"noParseCount": 0,
-				"data":       stocks,
+				"data":         stocks,
 			},
 		})
 	}
@@ -94,9 +94,9 @@ func largeJSONHandler() gin.HandlerFunc {
 			"errorCode":    0,
 			"errorMessage": "success",
 			"data": gin.H{
-				"count":      200,
+				"count":        200,
 				"noParseCount": 0,
-				"data":       stocks,
+				"data":         stocks,
 			},
 		})
 	}
@@ -119,25 +119,25 @@ func setupRouter(handler gin.HandlerFunc) *gin.Engine {
 }
 
 type debugResponse struct {
-	StatusCode    int
-	ContentEncoding string
-	ContentLength   string
+	StatusCode       int
+	ContentEncoding  string
+	ContentLength    string
 	TransferEncoding string
-	RawBodyLen    int
-	RawBodyPreview []byte
+	RawBodyLen       int
+	RawBodyPreview   []byte
 	DecompressedBody []byte
-	JSONParseOK   bool
-	ExtraData     bool
-	ExtraDataDetail string
-	FullBodyHex   string
+	JSONParseOK      bool
+	ExtraData        bool
+	ExtraDataDetail  string
+	FullBodyHex      string
 }
 
 func inspectResponse(t *testing.T, resp *http.Response) debugResponse {
 	t.Helper()
 	dr := debugResponse{
-		StatusCode:      resp.StatusCode,
-		ContentEncoding: resp.Header.Get("Content-Encoding"),
-		ContentLength:   resp.Header.Get("Content-Length"),
+		StatusCode:       resp.StatusCode,
+		ContentEncoding:  resp.Header.Get("Content-Encoding"),
+		ContentLength:    resp.Header.Get("Content-Length"),
 		TransferEncoding: strings.Join(resp.TransferEncoding, ","),
 	}
 
@@ -463,9 +463,9 @@ func getSecurityListHandlerSmall(n int) gin.HandlerFunc {
 			"errorCode":    0,
 			"errorMessage": "success",
 			"data": gin.H{
-				"count":      n,
+				"count":        n,
 				"noParseCount": 0,
-				"data":       stocks,
+				"data":         stocks,
 			},
 		})
 	}
@@ -545,7 +545,7 @@ func pythonStyleProcessResponse(t *testing.T, reqNum int, resp *http.Response) {
 	}
 
 	t.Logf("[Req %d] Attempting json.loads(body) ...", reqNum)
-	var parsed map[string]interface{}
+	var parsed map[string]any
 	if err := json.Unmarshal(bodyBytes, &parsed); err != nil {
 		fmt.Println("JSON PARSE FAILED")
 		t.Errorf("[Req %d] JSON PARSE FAILED: %v", reqNum, err)

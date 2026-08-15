@@ -103,13 +103,13 @@ func TestIntegration_BodyBufferPlusCompression_SmallJSON(t *testing.T) {
 	t.Logf("Response body (%d bytes): %q", len(body), string(body))
 
 	// 关键断言：响应体必须是有效 JSON（不多不少正好一个对象）
-	var parsed map[string]interface{}
+	var parsed map[string]any
 	err = json.Unmarshal(body, &parsed)
 	require.NoError(t, err, "Response body must be valid JSON (single object): %q", string(body))
 
 	// 验证是单个 JSON，没有 "Extra data"
 	dec := json.NewDecoder(bytes.NewReader(body))
-	var parsed2 map[string]interface{}
+	var parsed2 map[string]any
 	err = dec.Decode(&parsed2)
 	require.NoError(t, err)
 	if dec.More() {
@@ -143,9 +143,9 @@ func TestIntegration_BodyBufferPlusCompression_LargeJSON(t *testing.T) {
 			"errorCode":    0,
 			"errorMessage": "success",
 			"data": gin.H{
-				"count":      1000,
+				"count":        1000,
 				"noParseCount": 0,
-				"data":       stocks,
+				"data":         stocks,
 			},
 		})
 	})
@@ -190,7 +190,7 @@ func TestIntegration_BodyBufferPlusCompression_LargeJSON(t *testing.T) {
 
 	t.Logf("Decoded body size: %d bytes", len(decoded))
 
-	var parsed map[string]interface{}
+	var parsed map[string]any
 	err = json.Unmarshal(decoded, &parsed)
 	require.NoError(t, err, "Decoded body must be valid JSON: %s", string(decoded[:min(500, len(decoded))]))
 
@@ -299,7 +299,7 @@ func TestIntegration_BodyBufferPlusCompression_KeepAliveMultipleRequests(t *test
 
 		// 用 json.Decoder 严格检测 extra data
 		dec := json.NewDecoder(bytes.NewReader(decoded))
-		var obj map[string]interface{}
+		var obj map[string]any
 		err = dec.Decode(&obj)
 		require.NoError(t, err, "start=%d: decoded body not valid JSON: %q",
 			start, string(decoded[:min(200, len(decoded))]))

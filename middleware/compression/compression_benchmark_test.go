@@ -197,7 +197,7 @@ func BenchmarkCompression_HeaderLookup(b *testing.B) {
 
 func BenchmarkCompression_SyncPoolGetPut(b *testing.B) {
 	var pool sync.Pool
-	pool.New = func() interface{} {
+	pool.New = func() any {
 		gz, _ := gzip.NewWriterLevel(io.Discard, DefaultCompression)
 		return &gzipWriter{writer: gz}
 	}
