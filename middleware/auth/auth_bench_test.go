@@ -6,9 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"runtime"
-	"runtime/pprof"
 	"testing"
 	"time"
 
@@ -40,14 +37,6 @@ func BenchmarkJWTAuth_ValidToken(b *testing.B) {
 	})
 	tokenString, _ := token.SignedString(cfg.Secret)
 
-	f, err := os.Create("jwt_valid_cpu.prof")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer f.Close()
-	pprof.StartCPUProfile(f)
-	defer pprof.StopCPUProfile()
-
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		req := httptest.NewRequest(http.MethodGet, "/test", nil)
@@ -72,14 +61,6 @@ func BenchmarkJWTAuth_InvalidToken(b *testing.B) {
 		c.String(http.StatusOK, "ok")
 	})
 
-	f, err := os.Create("jwt_invalid_cpu.prof")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer f.Close()
-	pprof.StartCPUProfile(f)
-	defer pprof.StopCPUProfile()
-
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		req := httptest.NewRequest(http.MethodGet, "/test", nil)
@@ -103,14 +84,6 @@ func BenchmarkJWTAuth_MissingHeader(b *testing.B) {
 	router.GET("/test", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
-
-	f, err := os.Create("jwt_missing_cpu.prof")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer f.Close()
-	pprof.StartCPUProfile(f)
-	defer pprof.StopCPUProfile()
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -141,12 +114,6 @@ func BenchmarkJWTAuth_MemAllocation(b *testing.B) {
 	})
 	tokenString, _ := token.SignedString(cfg.Secret)
 
-	f, err := os.Create("jwt_mem.prof")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer f.Close()
-
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		req := httptest.NewRequest(http.MethodGet, "/test", nil)
@@ -154,9 +121,6 @@ func BenchmarkJWTAuth_MemAllocation(b *testing.B) {
 		recorder := httptest.NewRecorder()
 		router.ServeHTTP(recorder, req)
 	}
-
-	runtime.GC()
-	pprof.WriteHeapProfile(f)
 }
 
 func BenchmarkAPIKeyAuth_LinearSearch(b *testing.B) {
@@ -177,14 +141,6 @@ func BenchmarkAPIKeyAuth_LinearSearch(b *testing.B) {
 	router.GET("/test", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
-
-	f, err := os.Create("apikey_linear_cpu.prof")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer f.Close()
-	pprof.StartCPUProfile(f)
-	defer pprof.StopCPUProfile()
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -216,14 +172,6 @@ func BenchmarkAPIKeyAuth_NoMatch(b *testing.B) {
 		c.String(http.StatusOK, "ok")
 	})
 
-	f, err := os.Create("apikey_nomatch_cpu.prof")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer f.Close()
-	pprof.StartCPUProfile(f)
-	defer pprof.StopCPUProfile()
-
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		req := httptest.NewRequest(http.MethodGet, "/test", nil)
@@ -249,12 +197,6 @@ func BenchmarkAPIKeyAuth_MemAllocation(b *testing.B) {
 		c.String(http.StatusOK, "ok")
 	})
 
-	f, err := os.Create("apikey_mem.prof")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer f.Close()
-
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		req := httptest.NewRequest(http.MethodGet, "/test", nil)
@@ -262,9 +204,6 @@ func BenchmarkAPIKeyAuth_MemAllocation(b *testing.B) {
 		recorder := httptest.NewRecorder()
 		router.ServeHTTP(recorder, req)
 	}
-
-	runtime.GC()
-	pprof.WriteHeapProfile(f)
 }
 
 func BenchmarkAPIKeyAuth_LinearSearchOnly(b *testing.B) {
@@ -274,14 +213,6 @@ func BenchmarkAPIKeyAuth_LinearSearchOnly(b *testing.B) {
 	}
 
 	key := "api-key-50"
-
-	f, err := os.Create("apikey_searchonly_cpu.prof")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer f.Close()
-	pprof.StartCPUProfile(f)
-	defer pprof.StopCPUProfile()
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

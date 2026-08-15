@@ -19,6 +19,7 @@ type Config struct {
 type ipSet struct {
 	exactIPs map[string]struct{}
 	cidrNets []*net.IPNet
+	hasCIDR  bool
 }
 
 func newIPSet(ips []string) *ipSet {
@@ -33,23 +34,29 @@ func newIPSet(ips []string) *ipSet {
 			s.exactIPs[ip] = struct{}{}
 		}
 	}
+	s.hasCIDR = len(s.cidrNets) > 0
 	return s
 }
 
-func (s *ipSet) contains(ip string) bool {
+func (s *ipSet) contains(ip string, parsed net.IP) (bool, net.IP) {
 	if _, ok := s.exactIPs[ip]; ok {
-		return true
+		return true, parsed
 	}
-	parsed := net.ParseIP(ip)
+	if !s.hasCIDR {
+		return false, parsed
+	}
 	if parsed == nil {
-		return false
+		parsed = net.ParseIP(ip)
+		if parsed == nil {
+			return false, parsed
+		}
 	}
 	for _, cidr := range s.cidrNets {
 		if cidr.Contains(parsed) {
-			return true
+			return true, parsed
 		}
 	}
-	return false
+	return false, parsed
 }
 
 // ipFilter IP过滤器
@@ -79,14 +86,16 @@ func New(cfg Config) gin.HandlerFunc {
 
 		clientIP := c.ClientIP()
 
-		if f.blockedIPs.contains(clientIP) {
+		blocked, parsed := f.blockedIPs.contains(clientIP, nil)
+		if blocked {
 			c.String(http.StatusForbidden, "[403] ip blocked")
 			c.Abort()
 			return
 		}
 
 		if f.hasAllowed {
-			if !f.allowedIPs.contains(clientIP) {
+			allowed, _ := f.allowedIPs.contains(clientIP, parsed)
+			if !allowed {
 				c.String(http.StatusForbidden, "[403] ip not allowed")
 				c.Abort()
 				return

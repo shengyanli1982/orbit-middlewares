@@ -262,7 +262,7 @@ type gzBundle struct {
 }
 
 var gzBundlePool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		cw := &countingWriter{w: io.Discard}
 		gz, _ := gzip.NewWriterLevel(cw, DefaultCompression)
 		return &gzBundle{gz: gz, counter: cw}
@@ -270,7 +270,7 @@ var gzBundlePool = sync.Pool{
 }
 
 var gzipWriterPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return &gzipWriter{}
 	},
 }

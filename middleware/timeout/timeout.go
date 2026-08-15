@@ -12,8 +12,6 @@ import (
 
 type contextKey struct{}
 
-type ctxKey string
-
 // Config 超时中间件配置。
 type Config struct {
 	Skipper func(*gin.Context) bool
@@ -97,11 +95,7 @@ func New(cfg Config) gin.HandlerFunc {
 
 		// 设置标记，防止子请求递归
 		ctxWithMark := context.WithValue(ctx, contextKey{}, true)
-		ctxWithKeys := ctxWithMark
-		for k, v := range c.Keys {
-			ctxWithKeys = context.WithValue(ctxWithKeys, ctxKey(k), v)
-		}
-		reqWithCtx := c.Request.WithContext(ctxWithKeys)
+		reqWithCtx := c.Request.WithContext(ctxWithMark)
 
 		// 子 goroutine 使用独立的 bufferWriter，与主 goroutine 隔离
 		bw := newBufferWriter()

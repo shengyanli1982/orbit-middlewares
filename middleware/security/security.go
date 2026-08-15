@@ -25,8 +25,9 @@ type Config struct {
 
 // headerEntry 预计算的安全头 canonical key 与值。
 type headerEntry struct {
-	key   string // textproto.CanonicalMIMEHeaderKey 预计算结果
-	value string
+	key string // textproto.CanonicalMIMEHeaderKey 预计算结果
+	// pair 构建期预生成，cap==len==1，跨请求只读共享；下游对同 key 执行 Add 会因容量满而另分配数组，不会写穿共享数组。
+	pair []string
 }
 
 type securityHeaders struct {
@@ -79,8 +80,8 @@ func New(cfg Config) gin.HandlerFunc {
 	for _, c := range candidates {
 		if c.value != "" {
 			entries = append(entries, headerEntry{
-				key:   textproto.CanonicalMIMEHeaderKey(c.key),
-				value: c.value,
+				key:  textproto.CanonicalMIMEHeaderKey(c.key),
+				pair: []string{c.value},
 			})
 		}
 	}
@@ -102,7 +103,7 @@ func (h *securityHeaders) handle(c *gin.Context) {
 	// 直接写入底层 http.Header map，key 已预计算为 canonical 形式
 	hdr := c.Writer.Header()
 	for i := range h.headers {
-		hdr[h.headers[i].key] = []string{h.headers[i].value}
+		hdr[h.headers[i].key] = h.headers[i].pair
 	}
 
 	c.Next()
