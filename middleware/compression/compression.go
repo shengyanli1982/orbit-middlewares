@@ -256,16 +256,19 @@ func (g *gzipWriter) finish() {
 }
 
 // gzBundle 用于对象池复用的 gzip writer 和计数器。
+// level 记录 gz 的构造压缩级别：gzip.Writer.Reset 保留构造期 level，
+// 因此池中对象被不同 CompressionLevel 配置取用时必须检测并重建。
 type gzBundle struct {
 	gz      *gzip.Writer
 	counter *countingWriter
+	level   int
 }
 
 var gzBundlePool = sync.Pool{
 	New: func() any {
 		cw := &countingWriter{w: io.Discard}
 		gz, _ := gzip.NewWriterLevel(cw, DefaultCompression)
-		return &gzBundle{gz: gz, counter: cw}
+		return &gzBundle{gz: gz, counter: cw, level: DefaultCompression}
 	},
 }
 
@@ -358,11 +361,13 @@ func New(cfg Config) gin.HandlerFunc {
 		bundle := gzBundlePool.Get().(*gzBundle)
 		gw := gzipWriterPool.Get().(*gzipWriter)
 
-		// 重置 gzip writer 输出到 ResponseWriter
+		// 重置 gzip writer 输出到 ResponseWriter；
+		// 池对象的构造 level 与配置不符时重建（Reset 保留构造期 level，无法改级）
 		bundle.counter.w = c.Writer
 		bundle.counter.written = 0
-		if bundle.gz == nil {
+		if bundle.gz == nil || bundle.level != level {
 			bundle.gz, _ = gzip.NewWriterLevel(bundle.counter, level)
+			bundle.level = level
 		} else {
 			bundle.gz.Reset(bundle.counter)
 		}
