@@ -390,3 +390,108 @@ func TestCompression_RealHTTP_LargeJSON_GzipEncoded(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Contains(t, string(body), "success")
 }
+
+// compressOnce 以指定 CompressionLevel 对 payload 压缩一次，返回完整 gzip 字节流。
+func compressOnce(t *testing.T, level int, payload []byte) []byte {
+	t.Helper()
+	r := gin.New()
+	r.Use(New(Config{
+		CompressionLevel: level,
+		MinLength:        1,
+	}))
+	r.GET("/test", func(c *gin.Context) {
+		c.Data(http.StatusOK, "text/plain", payload)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "gzip", w.Header().Get("Content-Encoding"))
+	return w.Body.Bytes()
+}
+
+// gunzipBytes 解压 gzip 字节流并返回原始内容。
+func gunzipBytes(t *testing.T, data []byte) []byte {
+	t.Helper()
+	gr, err := gzip.NewReader(bytes.NewReader(data))
+	assert.NoError(t, err)
+	defer gr.Close()
+	out, err := io.ReadAll(gr)
+	assert.NoError(t, err)
+	return out
+}
+
+// stdlibGzip 使用标准库以指定 level 直接压缩 payload，作为字节级对照。
+// gzip.Writer.Reset 与新建 writer 输出字节等价（标准库文档承诺，init 全量重建状态）。
+func stdlibGzip(t *testing.T, level int, payload []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz, err := gzip.NewWriterLevel(&buf, level)
+	assert.NoError(t, err)
+	_, err = gz.Write(payload)
+	assert.NoError(t, err)
+	assert.NoError(t, gz.Close())
+	return buf.Bytes()
+}
+
+// mixedPayload 生成确定性的词级重复混合文本，保证不同 deflate 级别产生不同输出。
+func mixedPayload(n int) []byte {
+	words := []string{
+		"kline", "close", "open", "high", "low", "volume", "amount",
+		"TdxHq", "price", "data", "0123456789", "abcdefg", "market",
+		"security", "transaction", "minute", "tick",
+	}
+	var buf bytes.Buffer
+	x := uint32(12345)
+	for buf.Len() < n {
+		x = x*1103515245 + 12345 // LCG 确定性伪随机
+		buf.WriteString(words[(x>>16)%uint32(len(words))])
+		buf.WriteByte(' ')
+	}
+	return buf.Bytes()[:n]
+}
+
+// TestCompression_CompressionLevelActuallyApplied 回归测试（CompressionLevel 死配置修复）：
+// 配置的 CompressionLevel 必须实际贯通到 gzip.Writer 构造链。旧实现中
+// gzBundlePool.New 硬编码 DefaultCompression，且 gzip.Writer.Reset 保留构造期
+// level（z.init(w, z.level)），导致配置值编译通过但运行期永不生效。
+func TestCompression_CompressionLevelActuallyApplied(t *testing.T) {
+	payload := mixedPayload(4096)
+
+	fast := compressOnce(t, BestSpeed, payload)
+	best := compressOnce(t, BestCompression, payload)
+
+	// 两者都必须是合法 gzip，解压还原与原始载荷一致
+	assert.Equal(t, payload, gunzipBytes(t, fast))
+	assert.Equal(t, payload, gunzipBytes(t, best))
+
+	// level1 输出应大于 level9 —— 压缩级别实际影响产物
+	assert.Greater(t, len(fast), len(best),
+		"BestSpeed output should be larger than BestCompression when level is actually applied")
+
+	// 字节级对照：中间件输出应与标准库对应级别直接压缩完全一致
+	assert.True(t, bytes.Equal(stdlibGzip(t, BestSpeed, payload), fast),
+		"middleware output must byte-match stdlib BestSpeed compression, got %d bytes vs %d bytes",
+		len(fast), len(stdlibGzip(t, BestSpeed, payload)))
+	assert.True(t, bytes.Equal(stdlibGzip(t, BestCompression, payload), best),
+		"middleware output must byte-match stdlib BestCompression compression, got %d bytes vs %d bytes",
+		len(best), len(stdlibGzip(t, BestCompression, payload)))
+}
+
+// TestCompression_ZeroLevelKeepsDefaultBehavior 向后兼容红线：
+// CompressionLevel 未配置（零值）时行为必须与现状默认（DefaultCompression）完全一致。
+func TestCompression_ZeroLevelKeepsDefaultBehavior(t *testing.T) {
+	payload := mixedPayload(4096)
+
+	zero := compressOnce(t, 0, payload)
+	explicit := compressOnce(t, DefaultCompression, payload)
+
+	assert.Equal(t, payload, gunzipBytes(t, zero))
+	assert.Equal(t, explicit, zero,
+		"zero-value CompressionLevel must behave identically to DefaultCompression")
+	assert.True(t, bytes.Equal(stdlibGzip(t, DefaultCompression, payload), zero),
+		"default output must byte-match stdlib DefaultCompression")
+}
