@@ -1,7 +1,10 @@
+// ratelimiter 全局限流示例：所有请求共享同一个令牌桶。
+//
+// 运行: go run ./ratelimiter_global
+// 测试: 连续快速请求 curl -i http://127.0.0.1:8080/global ，突发超过 Burst 后返回 429
 package main
 
 import (
-	"fmt"
 	"net/http"
 	"time"
 
@@ -10,19 +13,13 @@ import (
 	"github.com/shengyanli1982/orbit-middlewares/middleware/ratelimiter"
 )
 
-// DemoService 示例服务，实现 orbit.Service 接口
+// DemoService 示例服务。
 type DemoService struct{}
 
-// RegisterGroup 注册路由组
+// RegisterGroup 注册路由组。
 func (s *DemoService) RegisterGroup(g *gin.RouterGroup) {
-	// 全局限流模式演示
 	g.GET("/global", func(c *gin.Context) {
 		c.String(http.StatusOK, "全局限流演示 - QPS=10, Burst=20")
-	})
-
-	// IP限流模式演示
-	g.GET("/per-ip", func(c *gin.Context) {
-		c.String(http.StatusOK, fmt.Sprintf("IP限流演示 - QPS=5, Burst=10, 客户端IP: %s", c.ClientIP()))
 	})
 }
 
@@ -33,13 +30,15 @@ func main() {
 
 	// 注册全局限流中间件
 	// ModeGlobal: 所有请求共享同一个令牌桶
-	// QPS=10: 每秒允许10个请求
-	// Burst=20: 允许最大突发20个请求
-	engine.RegisterMiddleware(ratelimiter.New(ratelimiter.Config{
+	// QPS/Burst: 必须大于 0
+	// New 返回 (handler, stop)，stop 用于释放后台资源，必须调用
+	rateLimitHandler, stop := ratelimiter.New(ratelimiter.Config{
 		Mode:  ratelimiter.ModeGlobal,
 		QPS:   10,
 		Burst: 20,
-	}))
+	})
+	defer stop()
+	engine.RegisterMiddleware(rateLimitHandler)
 
 	engine.RegisterService(&DemoService{})
 
