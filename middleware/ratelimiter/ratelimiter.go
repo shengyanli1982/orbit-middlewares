@@ -35,6 +35,7 @@ type Config struct {
 	Burst       int
 	TTL         time.Duration
 	IPExtractor func(*gin.Context) string
+	RejectHandler func(*gin.Context)
 }
 
 type ipLimiter struct {
@@ -75,6 +76,17 @@ func New(cfg Config) (gin.HandlerFunc, func()) {
 
 	limitHeader := strconv.Itoa(int(math.Ceil(cfg.QPS)))
 
+	reject := func(c *gin.Context, retryAfter string) {
+		c.Header("X-RateLimit-Limit", limitHeader)
+		c.Header("Retry-After", retryAfter)
+		if cfg.RejectHandler != nil {
+			cfg.RejectHandler(c)
+		} else {
+			c.String(http.StatusTooManyRequests, "[429] rate limit exceeded")
+		}
+		c.Abort()
+	}
+
 	handler := func(c *gin.Context) {
 		if cfg.Skipper != nil && cfg.Skipper(c) {
 			c.Next()
@@ -87,22 +99,14 @@ func New(cfg Config) (gin.HandlerFunc, func()) {
 				return
 			}
 			r := l.global.Reserve()
-			// Reserve OK 为 false：请求超过 burst 上限
 			if !r.OK() {
-				c.Header("X-RateLimit-Limit", limitHeader)
-				c.Header("Retry-After", "0")
-				c.String(http.StatusTooManyRequests, "[429] rate limit exceeded")
-				c.Abort()
+				reject(c, "0")
 				return
 			}
-			// Reserve Delay > 0：当前无可用 token
 			delay := r.Delay()
 			r.Cancel()
 			if delay > 0 {
-				c.Header("X-RateLimit-Limit", limitHeader)
-				c.Header("Retry-After", strconv.FormatInt(int64(math.Ceil(delay.Seconds())), 10))
-				c.String(http.StatusTooManyRequests, "[429] rate limit exceeded")
-				c.Abort()
+				reject(c, strconv.FormatInt(int64(math.Ceil(delay.Seconds())), 10))
 				return
 			}
 		} else {
@@ -113,21 +117,13 @@ func New(cfg Config) (gin.HandlerFunc, func()) {
 			}
 
 			ok, delay, r := l.allowIP(key)
-			// Reserve OK 为 false：请求超过 burst 上限
 			if !ok {
-				c.Header("X-RateLimit-Limit", limitHeader)
-				c.Header("Retry-After", "0")
-				c.String(http.StatusTooManyRequests, "[429] rate limit exceeded")
-				c.Abort()
+				reject(c, "0")
 				return
 			}
-			// Reserve Delay > 0：当前无可用 token
 			if delay > 0 {
 				r.Cancel()
-				c.Header("X-RateLimit-Limit", limitHeader)
-				c.Header("Retry-After", strconv.FormatInt(int64(math.Ceil(delay.Seconds())), 10))
-				c.String(http.StatusTooManyRequests, "[429] rate limit exceeded")
-				c.Abort()
+				reject(c, strconv.FormatInt(int64(math.Ceil(delay.Seconds())), 10))
 				return
 			}
 		}
