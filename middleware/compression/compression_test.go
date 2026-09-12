@@ -257,7 +257,13 @@ func TestCompression_CompressionLevel(t *testing.T) {
 	assert.Equal(t, "gzip", w.Header().Get("Content-Encoding"))
 }
 
-func TestCompression_ContentLengthAfterCompression(t *testing.T) {
+// TestCompression_NoMiddlewareContentLengthAfterCompression AUD-14 回归测试（修正假绿语义）：
+// 压缩路径不得由中间件设置 Content-Length——真实线路上 finish 的 Close 触发首次写入时
+// net/http 已固化响应头（WriteHeader 时克隆 header map），Close 之后再 Set 必然无效。
+// 线路分帧由 net/http 决定：<2KB 的压缩输出在 handler 结束时自动补 CL，否则 chunked
+// （见 TestCompression_RealHTTP_LargeCompressed_ChunkedNoContentLength）。
+// 旧断言 NotEmpty(CL) 仅在 httptest.Recorder 下成立（Recorder.Header() 是活 map），属假绿。
+func TestCompression_NoMiddlewareContentLengthAfterCompression(t *testing.T) {
 	r := gin.New()
 	r.Use(New(Config{
 		MinLength: 1,
@@ -273,7 +279,10 @@ func TestCompression_ContentLengthAfterCompression(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, "gzip", w.Header().Get("Content-Encoding"))
-	assert.NotEmpty(t, w.Header().Get("Content-Length"))
+	assert.Empty(t, w.Header().Get("Content-Length"),
+		"middleware must not set Content-Length after compression; framing is net/http's job")
+	assert.Equal(t, "This is a test response that should be compressed",
+		string(gunzipBytes(t, w.Body.Bytes())))
 }
 
 func TestCompression_AcceptEncodingNotGzip(t *testing.T) {
@@ -494,4 +503,67 @@ func TestCompression_ZeroLevelKeepsDefaultBehavior(t *testing.T) {
 		"zero-value CompressionLevel must behave identically to DefaultCompression")
 	assert.True(t, bytes.Equal(stdlibGzip(t, DefaultCompression, payload), zero),
 		"default output must byte-match stdlib DefaultCompression")
+}
+
+// TestCompression_PooledWriterReuseAfterSkip 钉住惰性 Reset 不变式：
+// skip 响应不再对池化 gzip.Writer 做 Reset/Close 清理，对象带着残留状态
+// （已关闭流或从未写入的全新流）直接回池；下一次取用并决定压缩时，
+// startCompress 的惰性 Reset 必须保证产出合法 gzip 流（magic、flate 流、
+// CRC32/ISIZE 全部正确），且与标准库全新 writer 直接压缩字节级一致。
+func TestCompression_PooledWriterReuseAfterSkip(t *testing.T) {
+	payload := mixedPayload(4096) // >= MinLength → 压缩路径
+	short := []byte("short")      // < MinLength → skip 缓冲路径
+
+	r := gin.New()
+	r.Use(New(Config{MinLength: 1024}))
+	r.GET("/compress", func(c *gin.Context) {
+		c.Data(http.StatusOK, "text/plain", payload)
+	})
+	r.GET("/skip", func(c *gin.Context) {
+		c.Data(http.StatusOK, "text/plain", short)
+	})
+
+	doReq := func(path string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	// 同一 goroutine 顺序请求，经真实 sync.Pool 复用对象，覆盖残留状态组合：
+	// 全新未写入→skip→压缩、已 Close→skip（不清理回池）→压缩、压缩→压缩。
+	sequence := []string{
+		"/skip",     // 全新 writer 未写入即回池
+		"/compress", // 对干净 writer 惰性 Reset
+		"/skip",     // 已 Close 状态 writer 不清理直接回池
+		"/skip",     // 连续 skip
+		"/compress", // 关键新路径：从「已 Close 后又被 skip」的残留状态惰性 Reset
+		"/compress", // 压缩紧接压缩（Close→Reset）回归对照
+		"/skip",     // 压缩后再 skip
+		"/compress", // skip 后再压缩
+	}
+
+	std := stdlibGzip(t, DefaultCompression, payload)
+	for i, path := range sequence {
+		w := doReq(path)
+		if path == "/skip" {
+			assert.Empty(t, w.Header().Get(headerContentEncoding),
+				"request #%d: skip response must not carry Content-Encoding", i)
+			assert.Equal(t, short, w.Body.Bytes(),
+				"request #%d: skip response body must pass through unchanged", i)
+			continue
+		}
+		assert.Equal(t, gzipEncoding, w.Header().Get(headerContentEncoding),
+			"request #%d: compressed response must carry Content-Encoding: gzip", i)
+		body := w.Body.Bytes()
+		// gzip.NewReader 校验 magic/header，ReadAll 校验 flate 流与 CRC32/ISIZE footer
+		assert.Equal(t, payload, gunzipBytes(t, body),
+			"request #%d: pooled writer reused after skip must still produce valid gzip", i)
+		// 字节级一致：惰性 Reset（init 全量重建状态）输出必须与全新 writer 等价
+		assert.True(t, bytes.Equal(std, body),
+			"request #%d: lazy-reset output must byte-match stdlib fresh compression (%d vs %d bytes)",
+			i, len(std), len(body))
+	}
 }

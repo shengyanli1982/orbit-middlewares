@@ -27,7 +27,7 @@ func TestSecurityHeaders_DefaultConfig(t *testing.T) {
 	assert.Equal(t, "nosniff", recorder.Header().Get("X-Content-Type-Options"))
 	assert.Equal(t, "max-age=31536000; includeSubDomains", recorder.Header().Get("Strict-Transport-Security"))
 	assert.Equal(t, "default-src 'self'", recorder.Header().Get("Content-Security-Policy"))
-	assert.Equal(t, "1; mode=block", recorder.Header().Get("X-XSS-Protection"))
+	assert.Equal(t, "0", recorder.Header().Get("X-XSS-Protection"))
 	assert.Equal(t, "strict-origin-when-cross-origin", recorder.Header().Get("Referrer-Policy"))
 	assert.Equal(t, "geolocation=(), microphone=(), camera=()", recorder.Header().Get("Permissions-Policy"))
 }
@@ -49,6 +49,7 @@ func TestSecurityHeaders_StrictConfig(t *testing.T) {
 	assert.Equal(t, "DENY", recorder.Header().Get("X-Frame-Options"))
 	assert.Equal(t, "max-age=63072000; includeSubDomains; preload", recorder.Header().Get("Strict-Transport-Security"))
 	assert.Equal(t, "default-src 'none'; script-src 'none'; object-src 'none'", recorder.Header().Get("Content-Security-Policy"))
+	assert.Equal(t, "0", recorder.Header().Get("X-XSS-Protection"))
 	assert.Equal(t, "no-referrer", recorder.Header().Get("Referrer-Policy"))
 	assert.Contains(t, recorder.Header().Get("Permissions-Policy"), "payment=()")
 }
