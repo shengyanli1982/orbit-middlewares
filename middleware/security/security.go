@@ -18,7 +18,7 @@ type Config struct {
 	HSTSIncludeSubDomains bool
 	HSTSPreload           bool
 	CSP                   string
-	XSSProtection         string
+	XSSProtection         string // X-XSS-Protection 已被 OWASP 废弃，预设 "0" 显式禁用
 	ReferrerPolicy        string
 	PermissionsPolicy     string
 }
@@ -116,7 +116,7 @@ func DefaultConfig() Config {
 		HSTSMaxAge:            31536000,
 		HSTSIncludeSubDomains: true,
 		CSP:                   "default-src 'self'",
-		XSSProtection:         "1; mode=block",
+		XSSProtection:         "0",
 		ReferrerPolicy:        "strict-origin-when-cross-origin",
 		PermissionsPolicy:     "geolocation=(), microphone=(), camera=()",
 	}
@@ -130,7 +130,7 @@ func StrictConfig() Config {
 		HSTSIncludeSubDomains: true,
 		HSTSPreload:           true,
 		CSP:                   "default-src 'none'; script-src 'none'; object-src 'none'",
-		XSSProtection:         "1; mode=block",
+		XSSProtection:         "0",
 		ReferrerPolicy:        "no-referrer",
 		PermissionsPolicy:     "geolocation=(), microphone=(), camera=(), payment=()",
 	}

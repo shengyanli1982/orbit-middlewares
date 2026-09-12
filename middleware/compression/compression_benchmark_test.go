@@ -210,3 +210,105 @@ func BenchmarkCompression_SyncPoolGetPut(b *testing.B) {
 		pool.Put(g)
 	}
 }
+
+// BenchmarkCompression_ErrorResponseSkip 覆盖 Write 决策状态机分支 2：
+// 错误响应（status >= 400）→ removeGzipHeaders（2 次 Header Del）→
+// skipAndWrite 透传。API 服务 4xx/5xx 响应的常见形态。
+func BenchmarkCompression_ErrorResponseSkip(b *testing.B) {
+	r := gin.New()
+	r.Use(New(Config{
+		MinLength: 1,
+	}))
+	r.GET("/test", func(c *gin.Context) {
+		c.String(http.StatusBadRequest, "[400] bad request")
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+	}
+}
+
+// BenchmarkCompression_BufferAccumulate 覆盖缓冲累积跨越阈值分支：
+// MinLength=1024，handler 写 200×11B 小块，前 ~93 块进缓冲区，
+// 跨越阈值时 startCompress + 整段排空进 gzip 流，其余走已决策快路径。
+// 默认配置（MinLength=1024）下典型 JSON 响应的生产形态。
+func BenchmarkCompression_BufferAccumulate(b *testing.B) {
+	r := gin.New()
+	r.Use(New(Config{
+		MinLength: 1024,
+	}))
+	chunk := []byte("chunk data\n")
+	r.GET("/test", func(c *gin.Context) {
+		for i := 0; i < 200; i++ {
+			c.Writer.Write(chunk)
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+	}
+}
+
+// BenchmarkCompression_ContentLengthFastPath 覆盖 Write 决策状态机分支 5：
+// handler 显式携带 Content-Length（c.File/ServeContent/DataFromReader 形态）
+// 时按长度快速决策，不经过缓冲。
+func BenchmarkCompression_ContentLengthFastPath(b *testing.B) {
+	body := bytes.Repeat([]byte("B"), 2048)
+	shortBody := bytes.Repeat([]byte("B"), 100)
+
+	b.Run("CompressDecision", func(b *testing.B) {
+		r := gin.New()
+		r.Use(New(Config{
+			MinLength: 1024,
+		}))
+		r.GET("/test", func(c *gin.Context) {
+			c.Writer.Header().Set("Content-Length", "2048")
+			c.Writer.WriteHeader(http.StatusOK)
+			c.Writer.Write(body)
+		})
+
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+
+		b.ResetTimer()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+		}
+	})
+
+	b.Run("SkipDecision", func(b *testing.B) {
+		r := gin.New()
+		r.Use(New(Config{
+			MinLength: 1024,
+		}))
+		r.GET("/test", func(c *gin.Context) {
+			c.Writer.Header().Set("Content-Length", "100")
+			c.Writer.WriteHeader(http.StatusOK)
+			c.Writer.Write(shortBody)
+		})
+
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+
+		b.ResetTimer()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+		}
+	})
+}

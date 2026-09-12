@@ -108,7 +108,7 @@ func BenchmarkSecurityHeaders_HSTSFullyConfigured(b *testing.B) {
 		HSTSIncludeSubDomains: true,
 		HSTSPreload:           true,
 		CSP:                   "default-src 'none'; script-src 'none'; object-src 'none'",
-		XSSProtection:         "1; mode=block",
+		XSSProtection:         "0",
 		ReferrerPolicy:        "no-referrer",
 		PermissionsPolicy:     "geolocation=(), microphone=(), camera=(), payment=()",
 	}

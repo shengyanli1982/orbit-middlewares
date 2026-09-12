@@ -49,6 +49,14 @@ func main() {
 	opts := orbit.NewOptions()
 	engine := orbit.NewEngine(config, opts)
 
+	// Timeout MUST be registered first: it replays the full middleware chain in an
+	// isolated goroutine, so any middleware registered before it would run twice
+	// per request (doubled side effects, duplicated response headers).
+	engine.RegisterMiddleware(timeout.New(timeout.Config{
+		Engine:  engine.GetGinEngine(), // pass the underlying *gin.Engine
+		Timeout: 10 * time.Second,
+	}))
+
 	engine.RegisterMiddleware(requestid.New(requestid.DefaultConfig()))
 	engine.RegisterMiddleware(security.New(security.DefaultConfig()))
 	engine.RegisterMiddleware(compression.New(compression.DefaultConfig()))
@@ -60,11 +68,6 @@ func main() {
 	})
 	defer stop()
 	engine.RegisterMiddleware(rateLimitHandler)
-
-	engine.RegisterMiddleware(timeout.New(timeout.Config{
-		Engine:  engine.GetGinEngine(), // pass the underlying *gin.Engine
-		Timeout: 10 * time.Second,
-	}))
 
 	engine.RegisterMiddleware(auth.APIKeyAuth(auth.APIKeyAuthConfig{
 		HeaderName: "X-API-Key",
@@ -105,6 +108,9 @@ engine.RegisterMiddleware(ipfilter.New(ipfilter.Config{
 - Returns `403 Forbidden` with `"[403] ip blocked"` or `"[403] ip not allowed"`
 - When only `BlockedIPs` is set, all other IPs are allowed
 - When only `AllowedIPs` is set, all other IPs are blocked
+- Panics at construction time on any malformed IP/CIDR entry (fail-fast — a typo in a blacklist entry must not be silently dropped)
+- Exact IP entries are normalized at construction time (e.g. uppercase IPv6 `ABCD::1` is stored as `abcd::1`, matching gin's canonical `c.ClientIP()` output)
+- **Trust boundary**: the client IP comes from gin's `c.ClientIP()`, which honors `X-Forwarded-For` / `X-Real-IP` when proxies are trusted. Call `router.SetTrustedProxies`, sit behind a proxy that sanitizes forwarding headers, or set `RemoteIPHeaders = nil` — otherwise a public-facing service can be bypassed with spoofed headers
 
 ---
 
@@ -118,7 +124,7 @@ engine.RegisterMiddleware(auth.JWTAuth(auth.JWTAuthConfig{
 }))
 ```
 
-Valid claims are stored in `c.Get("jwt_claims")`. Returns `401 Unauthorized` on failure.
+Valid claims are stored in `c.Get("jwt_claims")`. Returns `401 Unauthorized` on failure. The `Bearer` scheme prefix is matched case-insensitively (RFC 7235). Panics at construction time when both `Secret` and `KeyFunc` are empty/nil — an empty HMAC key would accept self-signed tokens (fail-open).
 
 Custom key function (e.g. RS256):
 
@@ -177,7 +183,22 @@ engine.RegisterMiddleware(handler)
 - `ModeGlobal`: one shared bucket for all requests
 - `ModeIP`: per-client-IP bucket, 256 shards, IPv4 and IPv6 supported
 - Adds `X-RateLimit-Limit` and `Retry-After` response headers
-- Returns `429 Too Many Requests` when exceeded
+- Returns `429 Too Many Requests` with body `"[429] rate limit exceeded"` when exceeded
+- Panics at construction time when `QPS <= 0` (NaN included) or `Burst <= 0` — an invalid limiter would reject every request
+- **Trust boundary**: `ModeIP` keys on `c.ClientIP()` by default, which honors `X-Forwarded-For` / `X-Real-IP` when proxies are trusted. Configure `router.SetTrustedProxies` for your real topology, or supply a custom `IPExtractor` (e.g. authenticated subject ID) — otherwise a public-facing service can be bypassed with spoofed headers minting a fresh bucket per request
+
+Custom reject response via `RejectHandler` (see [Custom Reject Responses](#custom-reject-responses) for the shared contract). `X-RateLimit-Limit` / `Retry-After` are already written when the callback runs (read or override via `c.Writer.Header()`); the callback writes the status code and body; `c.Abort()` is always called afterwards; `reason` is `ratelimiter.ReasonRateLimited`:
+
+```go
+handler, stop := ratelimiter.New(ratelimiter.Config{
+    Mode:  ratelimiter.ModeIP,
+    QPS:   100,
+    Burst: 200,
+    RejectHandler: func(c *gin.Context, reason string) {
+        c.JSON(http.StatusTooManyRequests, gin.H{"error": "slow down", "reason": reason})
+    },
+})
+```
 
 ---
 
@@ -209,7 +230,7 @@ engine.RegisterMiddleware(requestsize.New(requestsize.Config{
 }))
 ```
 
-Returns `413 Request Entity Too Large` if exceeded. `MaxSize` must be > 0.
+Returns `413 Request Entity Too Large` with body `"[413] request entity too large"` if exceeded. Panics at construction time when `MaxSize <= 0`.
 
 ---
 
@@ -217,14 +238,20 @@ Returns `413 Request Entity Too Large` if exceeded. `MaxSize` must be > 0.
 
 Enforces a per-request deadline. Requires the `*gin.Engine` instance to create an isolated context per request, avoiding `gin.Context` data races.
 
+**Must be registered first.** The middleware replays the full middleware chain inside an isolated goroutine (the recursion guard only covers timeout itself), so any middleware registered before it runs twice per request — doubled side effects (e.g. two rate-limit tokens consumed) and duplicated response headers (e.g. two different `X-Request-ID` values).
+
 ```go
+// register before all other middleware
 engine.RegisterMiddleware(timeout.New(timeout.Config{
     Engine:  engine.GetGinEngine(), // required
-    Timeout: 30 * time.Second,
+    Timeout: 30 * time.Second,      // must be > 0, panics otherwise
 }))
 ```
 
-Returns `504 Gateway Timeout` if the deadline is exceeded. The background goroutine is always waited on before returning, preventing goroutine leaks.
+- Returns `504 Gateway Timeout` with body `"[504] request timeout"` if the deadline is exceeded; the background goroutine is always waited on before returning, preventing goroutine leaks
+- Handler panics are recovered inside the worker goroutine and returned as `500` with body `"[500] internal server error"` — the process stays up
+- Panics at construction time when `Engine` is nil or `Timeout <= 0`
+- Buffered response headers replace same-named headers preset on the outer writer, so replayed middleware cannot duplicate header values
 
 ---
 
@@ -248,6 +275,9 @@ engine.RegisterMiddleware(compression.New(compression.Config{
 - Skips compression for error responses (4xx/5xx)
 - Adds `Content-Encoding: gzip` and `Vary: Accept-Encoding`
 - Reuses `gzip.Writer` via `sync.Pool`
+- `CompressionLevel` zero value means `DefaultCompression`; the `NoCompression` constant is **deprecated** (its value `0` is indistinguishable from the zero value — bypass the middleware if you need stored-only output)
+- Compressed responses that outgrow the buffer are sent chunked without `Content-Length` (net/http freezes headers once the first body byte hits the wire)
+- ETags set by handlers are preserved on passthrough and `304 Not Modified` responses (RFC 7232); weakening to `W/` happens only on actually-compressed responses
 
 ---
 
@@ -273,7 +303,7 @@ engine.RegisterMiddleware(security.New(security.Config{
 }))
 ```
 
-Headers set: `X-Frame-Options`, `X-Content-Type-Options`, `Strict-Transport-Security`, `Content-Security-Policy`, `X-XSS-Protection`, `Referrer-Policy`, `Permissions-Policy`.
+Headers set: `X-Frame-Options`, `X-Content-Type-Options`, `Strict-Transport-Security`, `Content-Security-Policy`, `X-XSS-Protection`, `Referrer-Policy`, `Permissions-Policy`. The `Default`/`Strict` presets send `X-XSS-Protection: 0` — OWASP deprecates the legacy `1; mode=block` (it introduces XSS leaks in older browsers), so the auditor is explicitly disabled.
 
 ---
 
@@ -290,21 +320,68 @@ engine.RegisterMiddleware(auth.JWTAuth(auth.JWTAuthConfig{
 }))
 ```
 
+## Error Response Convention
+
+All middleware emit plain-text error bodies in the form `"[code] message"` — e.g. `"[403] ip blocked"`, `"[413] request entity too large"`, `"[429] rate limit exceeded"`, `"[500] internal server error"`, `"[504] request timeout"`.
+
+## Custom Reject Responses
+
+Every middleware with a reject point accepts an optional `RejectHandler` in its config, sharing one contract:
+
+```go
+RejectHandler func(c *gin.Context, reason string)
+```
+
+- The callback runs instead of the default response and receives `reason` — one of the exported `Reason*` constants of that package
+- The callback writes the status code and body
+- `c.Abort()` is always called after the callback returns, whether or not the callback aborted itself
+- A nil `RejectHandler` keeps the default plain-text response (see [Error Response Convention](#error-response-convention))
+
+`reason` values follow a global `<domain>.<cause>` naming scheme:
+
+- `domain` is the functional area (`auth`, `ip`, `ratelimit`, `request`) and self-identifies which middleware issued the rejection — reasons stay globally unique, so one shared handler can be safely registered across multiple middleware
+- `cause` is a snake_case state description; the subject is omitted when self-evident within the domain (`ratelimit.exceeded`) and prefixed when the domain covers multiple subjects (`auth.token_missing` vs `auth.apikey_missing`)
+- New middleware or new reject reasons extend the same scheme
+
+| Middleware    | Config field                          | Reason constants                                                          | Reject point                     |
+| ------------- | ------------------------------------- | ------------------------------------------------------------------------- | -------------------------------- |
+| `IPFilter`    | `ipfilter.Config.RejectHandler`       | `ReasonBlocked` = `ip.blocked`, `ReasonNotAllowed` = `ip.not_allowed`     | blacklist hit / not in whitelist |
+| `JWTAuth`     | `auth.JWTAuthConfig.RejectHandler`    | `ReasonMissingToken` = `auth.token_missing`, `ReasonInvalidToken` = `auth.token_invalid` | missing / invalid bearer token   |
+| `APIKeyAuth`  | `auth.APIKeyAuthConfig.RejectHandler` | `ReasonMissingAPIKey` = `auth.apikey_missing`, `ReasonInvalidAPIKey` = `auth.apikey_invalid` | missing / invalid API key        |
+| `RateLimiter` | `ratelimiter.Config.RejectHandler`    | `ReasonRateLimited` = `ratelimit.exceeded`                                | rate limit exceeded              |
+| `RequestSize` | `requestsize.Config.RejectHandler`    | `ReasonEntityTooLarge` = `request.entity_too_large`                       | Content-Length fast reject       |
+| `Timeout`     | `timeout.Config.RejectHandler`        | `ReasonTimeout` = `request.timeout`                                       | 504 request timeout              |
+
+Example — uniform JSON reject responses for `IPFilter`:
+
+```go
+engine.RegisterMiddleware(ipfilter.New(ipfilter.Config{
+    BlockedIPs: []string{"1.2.3.4"},
+    RejectHandler: func(c *gin.Context, reason string) {
+        c.JSON(http.StatusForbidden, gin.H{"error": "access denied", "reason": reason})
+    },
+}))
+```
+
+Coverage notes:
+
+- `RateLimiter`: `X-RateLimit-Limit` / `Retry-After` are already set when the callback runs (read or override via `c.Writer.Header()`)
+- `RequestSize`: covers the Content-Length fast-reject path only — on chunked transfers the 413 surfaced by `http.MaxBytesReader` is emitted by the downstream handler that reads the body
+- `Timeout`: covers the 504 timeout path only — the panic-recovery 500 response is written through the worker goroutine's buffered writer and keeps the default body
+
 ## Examples
 
-Runnable demos in [`examples/`](./examples):
+Runnable demos live in [`examples/`](./examples) — one subdirectory per example, as a separate Go module wired to the repo root via `replace`.
 
-- [`combined_example.go`](./examples/combined_example.go)
-- [`jwt_example.go`](./examples/jwt_example.go)
-- [`apikey_example.go`](./examples/apikey_example.go)
-- [`ratelimiter_ip_example.go`](./examples/ratelimiter_ip_example.go)
-- [`ratelimiter_global_example.go`](./examples/ratelimiter_global_example.go)
-- [`ipfilter_example.go`](./examples/ipfilter_example.go)
-- [`requestid_example.go`](./examples/requestid_example.go)
-- [`requestsize_example.go`](./examples/requestsize_example.go)
-- [`timeout_example.go`](./examples/timeout_example.go)
-- [`compression_example.go`](./examples/compression_example.go)
-- [`security_example.go`](./examples/security_example.go)
+Available: `apikey`, `combined`, `compression`, `ipfilter`, `jwt`, `ratelimiter_global`, `ratelimiter_ip`, `requestid`, `requestsize`, `security`, `timeout`.
+
+```bash
+cd examples
+go build ./...     # build every example
+go run ./timeout   # run one example
+# or from inside an example directory:
+cd timeout && go run .
+```
 
 ## Testing
 
