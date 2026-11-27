@@ -8,6 +8,15 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// resetRecorder 把 recorder 恢复到本轮干净状态：清空 Body 防逐轮累积，清空响应头
+// 防跨轮残留。标准库 ResponseRecorder 无 Reset 方法，但 Body 与 HeaderMap 均为导出
+// 字段，直接复位即可消除无界增长；未导出的 wroteHeader 自第 2 轮起保持 true，仅
+// 跳过 recorder 自身的记录逻辑（基准不断言响应内容），不改变被测调用路径。
+func resetRecorder(rw *httptest.ResponseRecorder) {
+	rw.Body.Reset()
+	clear(rw.Header())
+}
+
 func BenchmarkSecurityHeaders_AllHeaders(b *testing.B) {
 	gin.SetMode(gin.TestMode)
 
@@ -21,8 +30,9 @@ func BenchmarkSecurityHeaders_AllHeaders(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		req := httptest.NewRequest(http.MethodGet, "/test", nil)
-		recorder := httptest.NewRecorder()
+		recorder := httptest.NewRecorder() // 每轮 Reset，防 Body 跨轮累积抬高 GC heap goal
 		for pb.Next() {
+			resetRecorder(recorder)
 			router.ServeHTTP(recorder, req)
 		}
 	})
@@ -44,8 +54,9 @@ func BenchmarkSecurityHeaders_MinimalHeaders(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		req := httptest.NewRequest(http.MethodGet, "/test", nil)
-		recorder := httptest.NewRecorder()
+		recorder := httptest.NewRecorder() // 每轮 Reset，防 Body 跨轮累积抬高 GC heap goal
 		for pb.Next() {
+			resetRecorder(recorder)
 			router.ServeHTTP(recorder, req)
 		}
 	})
@@ -64,8 +75,9 @@ func BenchmarkSecurityHeaders_NoHeaders(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		req := httptest.NewRequest(http.MethodGet, "/test", nil)
-		recorder := httptest.NewRecorder()
+		recorder := httptest.NewRecorder() // 每轮 Reset，防 Body 跨轮累积抬高 GC heap goal
 		for pb.Next() {
+			resetRecorder(recorder)
 			router.ServeHTTP(recorder, req)
 		}
 	})
@@ -121,8 +133,9 @@ func BenchmarkSecurityHeaders_HSTSFullyConfigured(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		req := httptest.NewRequest(http.MethodGet, "/test", nil)
-		recorder := httptest.NewRecorder()
+		recorder := httptest.NewRecorder() // 每轮 Reset，防 Body 跨轮累积抬高 GC heap goal
 		for pb.Next() {
+			resetRecorder(recorder)
 			router.ServeHTTP(recorder, req)
 		}
 	})

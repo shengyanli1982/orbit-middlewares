@@ -3,6 +3,7 @@ package requestid
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"net/textproto"
 	"sync"
 
 	"github.com/gin-gonic/gin"
@@ -45,6 +46,8 @@ func New(cfg Config) gin.HandlerFunc {
 	if headerName == "" {
 		headerName = "X-Request-ID"
 	}
+	// 构造期预规范化 header 名，热路径 GetHeader/Header 命中 textproto 零分配快速路径
+	headerName = textproto.CanonicalMIMEHeaderKey(headerName)
 
 	return func(c *gin.Context) {
 		if cfg.Skipper != nil && cfg.Skipper(c) {

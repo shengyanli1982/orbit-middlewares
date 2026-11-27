@@ -2,6 +2,7 @@ package auth
 
 import (
 	"net/http"
+	"net/textproto"
 
 	"github.com/gin-gonic/gin"
 )
@@ -51,6 +52,8 @@ func APIKeyAuth(cfg APIKeyAuthConfig) gin.HandlerFunc {
 	if cfg.HeaderName == "" {
 		cfg.HeaderName = "X-API-Key"
 	}
+	// 构造期预规范化 header 名，热路径 GetHeader 命中 textproto 零分配快速路径
+	cfg.HeaderName = textproto.CanonicalMIMEHeaderKey(cfg.HeaderName)
 
 	auth := &apiKeyAuth{
 		skipper:    cfg.Skipper,
@@ -106,7 +109,6 @@ func APIKeyAuth(cfg APIKeyAuthConfig) gin.HandlerFunc {
 
 // extractAPIKey 从 Query 或 Header 提取 API Key，Query 优先。
 func extractAPIKey(c *gin.Context, headerName, queryParam string) string {
-	// 优先从 Query 参数获取
 	if queryParam != "" {
 		key := c.Query(queryParam)
 		if key != "" {
@@ -114,7 +116,6 @@ func extractAPIKey(c *gin.Context, headerName, queryParam string) string {
 		}
 	}
 
-	// 其次从 Header 获取
 	if headerName != "" {
 		key := c.GetHeader(headerName)
 		if key != "" {
