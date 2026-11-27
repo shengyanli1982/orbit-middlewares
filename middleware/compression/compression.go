@@ -1,10 +1,15 @@
 // Package compression 实现 Gin 的 gzip 压缩中间件。
 //
 // 设计思路：
-//   - Content-Encoding: gzip 在决定压缩时才设置（延迟设置）
-//   - 延迟决策：请求体先缓冲，达到 MinLength 后再决定是否压缩
-//   - 请求体小于 MinLength 时，不提交响应头，可安全移除提示
-//   - 错误响应（4xx/5xx）不压缩
+//   - 预置再撤销：handler 运行前先预置 Content-Encoding: gzip 与
+//     Vary: Accept-Encoding，供流式压缩路径使用；若最终未压缩，
+//     在响应头提交前撤销（Write 状态门 / Flush 与 WriteHeaderNow 的
+//     未决策守卫 / finish）
+//   - 延迟决策：请求体先缓冲，达到 MinLength 后再决定是否压缩；
+//     未决策即提交响应头的路径（Flush / WriteHeaderNow）转入永久 skip
+//   - Vary 撤销为精确移除：仅移除本中间件添加的 Accept-Encoding 值，
+//     保留其他写入方设置的值（如 CORS 场景的 Origin）
+//   - 错误响应（4xx/5xx）、206 分片与 304 条件响应不压缩
 //   - 已压缩的内容直接透传
 package compression
 
@@ -131,7 +136,8 @@ func (g *gzipWriter) startCompress() {
 	g.decided = true
 	g.compressing = true
 	g.Header().Set(headerContentEncoding, gzipEncoding)
-	g.Header().Add(headerVary, headerAcceptEncoding)
+	// Vary: Accept-Encoding 由 New 单点预置，凡能到达此处的路径该预置必在位
+	// （发生撤销的路径均已转入 skip，不经过本函数），此处再追加会产生线路重复值。
 }
 
 // skipCompress 在决定不压缩时调用，标记已完成决策。
@@ -189,9 +195,13 @@ func (g *gzipWriter) Write(data []byte) (int, error) {
 
 	g.status = g.ResponseWriter.Status()
 
-	// 错误响应，不压缩；先移除压缩头再排空缓冲，
-	// 确保真实线路上头提交时不携带 Content-Encoding
-	if g.status >= http.StatusBadRequest {
+	// 错误响应与语义上不可整体重写的响应，不压缩；先移除压缩头再排空缓冲，
+	// 确保真实线路上头提交时不携带 Content-Encoding。
+	// 206 分片：body 字节与 Content-Range 偏移严格对应，gzip 重写即破坏
+	// Range 语义；304：无 body 的条件响应，携带 Content-Encoding 属无效头。
+	if g.status >= http.StatusBadRequest ||
+		g.status == http.StatusPartialContent ||
+		g.status == http.StatusNotModified {
 		g.removeGzipHeaders()
 		return g.skipAndWrite(data)
 	}
@@ -210,6 +220,8 @@ func (g *gzipWriter) Write(data []byte) (int, error) {
 	if clStr := g.Header().Get("Content-Length"); clStr != "" {
 		if cl, err := strconv.Atoi(clStr); err == nil {
 			if cl < g.minLen {
+				// 短响应不压缩；先移除预置压缩头再直通，确保首次底层写入触发头提交时不携带 Content-Encoding。
+				g.removeGzipHeaders()
 				return g.skipAndWrite(data)
 			}
 			g.Header().Del("Content-Length")
@@ -253,7 +265,21 @@ func (g *gzipWriter) Written() bool {
 }
 
 // WriteHeaderNow 提交响应头。
+//
+// 未决策守卫：c.AbortWithStatus 等无 body 路径会直调本方法提交响应头。
+// 直接转发会让预置的压缩头随提交固化上线（头撤销仅在提交前有效），
+// 线路上出现「错误状态码 + Content-Encoding: gzip + 空 body」的头-body
+// 撕裂。因此未决策时先撤销预置头、排空已缓冲字节并转入永久 skip，
+// 再转发提交——与 Flush 的未决策分支同型。
 func (g *gzipWriter) WriteHeaderNow() {
+	if !g.decided {
+		g.removeGzipHeaders()
+		g.skipCompress()
+		if g.buf.Len() > 0 {
+			_, _ = g.ResponseWriter.Write(g.buf.Bytes())
+			g.buf.Reset()
+		}
+	}
 	g.ResponseWriter.WriteHeaderNow()
 }
 
@@ -289,12 +315,52 @@ func (g *gzipWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return g.ResponseWriter.Hijack()
 }
 
-// removeGzipHeaders 移除中间件预设置的压缩相关头，仅在响应头未提交前调用。
+// removeGzipHeaders 移除中间件预设置的压缩相关头，仅在响应头未提交前调用有效
+// （头已提交后 Del/Set 无害但无效）。Vary 键是所有写入方共享的，故采用精确
+// 移除：仅剔除本中间件添加的 Accept-Encoding 值，保留其他写入方设置的值
+// （如 CORS 场景的 Origin）；值列表清空后才删除整个 Vary 键。
 // 不触碰 handler 自设的 ETag：非压缩直通路径下强校验器仍然有效，
 // 且 RFC 7232 §4.1 要求 304 等响应携带校验器；ETag 弱化仅发生在实际压缩路径（见 finish）。
 func (g *gzipWriter) removeGzipHeaders() {
 	g.Header().Del(headerContentEncoding)
-	g.Header().Del(headerVary)
+	removeVaryAcceptEncoding(g.Header())
+}
+
+// removeVaryAcceptEncoding 从 Vary 头的值列表中精确移除 Accept-Encoding 值
+// （大小写不敏感）。仅当列表中确实存在该值时才改写：剩余值非空则保留其余值，
+// 全部移除后才 Del 整键；无该值时不触碰 Vary，保留外部组件的设置。
+func removeVaryAcceptEncoding(h http.Header) {
+	values := h.Values(headerVary)
+	if len(values) == 0 {
+		return
+	}
+	// 先无分配扫描统计非 AE 的幸存值，使「仅含 AE 全删」与「无 AE 不触碰」
+	// 这两种常见形态都不再分配一个即弃的切片。
+	survivors := 0
+	for _, v := range values {
+		if !strings.EqualFold(v, headerAcceptEncoding) {
+			survivors++
+		}
+	}
+	switch {
+	case survivors == len(values):
+		// 无 AE 值：不触碰 Vary，保留外部组件的设置。
+		return
+	case survivors == 0:
+		// 值列表全是 AE：清空后才删除整个键。
+		h.Del(headerVary)
+	default:
+		// 仅部分幸存时才分配新切片承接幸存值；不得复用 values 的内部数组，
+		// 否则别名写穿会改写原始数据。headerVary 已是规范键，整体写回。
+		kept := make([]string, 0, survivors)
+		for _, v := range values {
+			if strings.EqualFold(v, headerAcceptEncoding) {
+				continue
+			}
+			kept = append(kept, v)
+		}
+		h[headerVary] = kept
+	}
 }
 
 // finish 完成响应写入，清理资源。由中间件 defer 调用。
@@ -447,7 +513,8 @@ func New(cfg Config) gin.HandlerFunc {
 		gw.reset(c.Writer, bundle.gz, bundle.box, minLength, needsReset)
 		c.Writer = gw
 
-		// 预先设置 Content-Encoding，若最终不压缩则在 defer 中移除
+		// 预置压缩头供流式压缩路径使用；若最终未压缩，由各撤销守卫在
+		// 响应头提交前移除（Write 状态门 / Flush / WriteHeaderNow / finish）
 		c.Header(headerContentEncoding, gzipEncoding)
 		c.Writer.Header().Add(headerVary, headerAcceptEncoding)
 

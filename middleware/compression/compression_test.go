@@ -257,12 +257,12 @@ func TestCompression_CompressionLevel(t *testing.T) {
 	assert.Equal(t, "gzip", w.Header().Get("Content-Encoding"))
 }
 
-// TestCompression_NoMiddlewareContentLengthAfterCompression AUD-14 回归测试（修正假绿语义）：
+// TestCompression_NoMiddlewareContentLengthAfterCompression 回归测试：
 // 压缩路径不得由中间件设置 Content-Length——真实线路上 finish 的 Close 触发首次写入时
 // net/http 已固化响应头（WriteHeader 时克隆 header map），Close 之后再 Set 必然无效。
 // 线路分帧由 net/http 决定：<2KB 的压缩输出在 handler 结束时自动补 CL，否则 chunked
 // （见 TestCompression_RealHTTP_LargeCompressed_ChunkedNoContentLength）。
-// 旧断言 NotEmpty(CL) 仅在 httptest.Recorder 下成立（Recorder.Header() 是活 map），属假绿。
+// 注：httptest.Recorder 下 Header() 是活 map，无法暴露该差异。
 func TestCompression_NoMiddlewareContentLengthAfterCompression(t *testing.T) {
 	r := gin.New()
 	r.Use(New(Config{
@@ -319,6 +319,55 @@ func TestCompression_VaryHeader(t *testing.T) {
 
 	vary := w.Header().Get("Vary")
 	assert.Contains(t, vary, "Accept-Encoding")
+}
+
+// TestCompression_removeVaryAcceptEncoding 钉住 Vary 值级精确移除的全分支语义：
+// 仅移除 Accept-Encoding（大小写不敏感），保留其他写入方的值并保持原有顺序；
+// 值列表被全部移除后才删除整个 Vary 键；不含 Accept-Encoding 时完全不触碰 Vary。
+// 该函数无导出入口，本测试直接调用以覆盖 wire 测试未触及的分支（无 AE 保留、
+// 重复 AE、多幸存值保序、大小写不敏感），为移除路径的零分配改写提供行为基线。
+func TestCompression_removeVaryAcceptEncoding(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    []string // 预置的 Vary 值；nil 表示不设置 Vary 键
+		expected []string // 期望移除后的 Vary 值；nil 表示 Vary 键应不存在
+	}{
+		{name: "无 Vary 键不触碰", input: nil, expected: nil},
+		{name: "单个 AE 删整键", input: []string{"Accept-Encoding"}, expected: nil},
+		{name: "重复 AE 删整键", input: []string{"Accept-Encoding", "Accept-Encoding"}, expected: nil},
+		{name: "小写 AE 大小写不敏感删除", input: []string{"accept-encoding"}, expected: nil},
+		{name: "无 AE 保留外部单值", input: []string{"Origin"}, expected: []string{"Origin"}},
+		{name: "无 AE 保留外部多值", input: []string{"Origin", "X-Custom"}, expected: []string{"Origin", "X-Custom"}},
+		{name: "AE 在外部值前精确移除", input: []string{"Accept-Encoding", "Origin"}, expected: []string{"Origin"}},
+		{name: "AE 在外部值后精确移除", input: []string{"Origin", "Accept-Encoding"}, expected: []string{"Origin"}},
+		{name: "AE 居中多幸存值保序", input: []string{"Origin", "Accept-Encoding", "X-Custom"}, expected: []string{"Origin", "X-Custom"}},
+		{name: "混合大小写移除保留外部值", input: []string{"Origin", "accept-encoding"}, expected: []string{"Origin"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := http.Header{}
+			if tt.input != nil {
+				h[headerVary] = tt.input
+			}
+			removeVaryAcceptEncoding(h)
+			assert.Equal(t, tt.expected, h.Values(headerVary))
+		})
+	}
+}
+
+// TestCompression_removeVaryAcceptEncoding_NoAliasWriteThrough 钉住幸存值必须由
+// 新切片承接：移除后写回的值列表不得与原始底层数组共享，避免改写穿原始数据。
+func TestCompression_removeVaryAcceptEncoding_NoAliasWriteThrough(t *testing.T) {
+	original := []string{"Origin", "Accept-Encoding", "X-Custom"}
+	h := http.Header{}
+	h[headerVary] = original
+
+	removeVaryAcceptEncoding(h)
+
+	assert.Equal(t, []string{"Origin", "X-Custom"}, h.Values(headerVary),
+		"结果应仅含幸存值")
+	assert.Equal(t, []string{"Origin", "Accept-Encoding", "X-Custom"}, original,
+		"原始切片不得被写穿（结果与原始不共享底层数组）")
 }
 
 // TestCompression_RealHTTP_SmallJSON_NoFalseGzipHeader 回归测试：
@@ -463,10 +512,10 @@ func mixedPayload(n int) []byte {
 	return buf.Bytes()[:n]
 }
 
-// TestCompression_CompressionLevelActuallyApplied 回归测试（CompressionLevel 死配置修复）：
-// 配置的 CompressionLevel 必须实际贯通到 gzip.Writer 构造链。旧实现中
-// gzBundlePool.New 硬编码 DefaultCompression，且 gzip.Writer.Reset 保留构造期
-// level（z.init(w, z.level)），导致配置值编译通过但运行期永不生效。
+// TestCompression_CompressionLevelActuallyApplied 回归测试：
+// 配置的 CompressionLevel 必须实际贯通到 gzip.Writer 构造链。
+// gzip.Writer.Reset 保留构造期 level（z.init(w, z.level)），池化对象
+// 被不同 level 配置取用时若不重建，配置值编译通过但运行期永不生效。
 func TestCompression_CompressionLevelActuallyApplied(t *testing.T) {
 	payload := mixedPayload(4096)
 
