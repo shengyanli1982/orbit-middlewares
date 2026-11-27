@@ -318,6 +318,23 @@ func guardSub(name string) string {
 	return strings.ReplaceAll(strconv.Quote(name), "/", "∕")
 }
 
+// guardInvalidWindowsName 判定文件名在 Windows 上是否无法真实存在。
+//
+// 除 Win32 禁用字符与控制字符外，还覆盖会被路径规范化剥离的尾随空格与尾随 '.'；
+// 含 ':' 的名字写入时不报错——NTFS 将其解释为 Alternate Data Stream，实际落盘的
+// 是冒号前的 0 字节基名文件——故必须在写入前过滤，而非依赖写入失败兜底。
+func guardInvalidWindowsName(name string) bool {
+	if strings.ContainsAny(name, `<>:"/\|?*`) {
+		return true
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return strings.HasSuffix(name, " ") || strings.HasSuffix(name, ".")
+}
+
 // guardCreateMatrix 在 root 下创建矩阵文件，返回成功创建的名字集合。
 //
 // 创建失败的处理分两档，避免用 Skip 掩盖真实缺陷：
@@ -327,6 +344,10 @@ func guardCreateMatrix(t *testing.T, root string) map[string]bool {
 	t.Helper()
 	created := make(map[string]bool, len(guardNameMatrix))
 	for _, c := range guardNameMatrix {
+		if runtime.GOOS == "windows" && guardInvalidWindowsName(c.name) {
+			t.Logf("SKIP-WINDOWS %q: invalid Windows filename", c.name)
+			continue
+		}
 		err := os.WriteFile(filepath.Join(root, c.name), []byte("X"), 0o644)
 		if err != nil {
 			if runtime.GOOS == "windows" {
@@ -791,6 +812,9 @@ func TestRender_HrefRoundTrip_PropertyBased(t *testing.T) {
 //
 // 未标注的断言（安全性判据、链接可用性）在两种机制下都必须保持 GREEN，不得放宽。
 func TestRender_HrefSchemeLike_CurrentBehavior(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 文件名禁用 ':'（NTFS ADS 语义），scheme-like 矩阵项无法真实存在")
+	}
 	body, created, r := guardMatrixBody(t)
 	rows := indexGuardRows(t, parseGuardRows(t, body))
 
