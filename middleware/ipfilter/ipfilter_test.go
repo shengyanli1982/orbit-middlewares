@@ -108,14 +108,12 @@ func TestIPLimiter_AllowedCIDR(t *testing.T) {
 		c.String(http.StatusOK, "ok")
 	})
 
-	// 在 CIDR 范围内，应该允许
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
 	req.RemoteAddr = "192.168.1.100:1234"
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, req)
 	assert.Equal(t, http.StatusOK, recorder.Code)
 
-	// 不在 CIDR 范围内，应该拒绝
 	req2 := httptest.NewRequest(http.MethodGet, "/test", nil)
 	req2.RemoteAddr = "192.168.2.1:1234"
 	recorder2 := httptest.NewRecorder()
@@ -136,7 +134,6 @@ func TestIPLimiter_BlockedCIDR(t *testing.T) {
 		c.String(http.StatusOK, "ok")
 	})
 
-	// 在黑名单 CIDR 范围内，应该拒绝
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
 	req.RemoteAddr = "10.1.2.3:1234"
 	recorder := httptest.NewRecorder()
@@ -144,7 +141,6 @@ func TestIPLimiter_BlockedCIDR(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, recorder.Code)
 	assert.Contains(t, recorder.Body.String(), "[403]")
 
-	// 不在黑名单 CIDR 范围内，应该允许
 	req2 := httptest.NewRequest(http.MethodGet, "/test", nil)
 	req2.RemoteAddr = "192.168.1.1:1234"
 	recorder2 := httptest.NewRecorder()
@@ -215,7 +211,7 @@ func TestIPLimiter_Skipper(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, recorder2.Code)
 }
 
-// TestNewIPSet_PanicsOnInvalidEntries AUD-10：非法 CIDR/IP 条目必须在构造时 panic（fail-fast），
+// TestNewIPSet_PanicsOnInvalidEntries 非法 CIDR/IP 条目必须在构造时 panic（fail-fast），
 // 禁止静默跳过——否则黑名单笔误（如 "10.0.0.0/33"）会被无声吞掉，安全配置 fail-open。
 // panic 消息必须包含具体条目，便于定位配置错误。
 func TestNewIPSet_PanicsOnInvalidEntries(t *testing.T) {
@@ -255,7 +251,7 @@ func TestNewIPSet_PanicsOnInvalidEntries(t *testing.T) {
 	}
 }
 
-// TestNewIPSet_NormalizesExactIPs AUD-10：精确 IP 条目必须经 net.ParseIP 归一化后入集合，
+// TestNewIPSet_NormalizesExactIPs 精确 IP 条目必须经 net.ParseIP 归一化后入集合，
 // 与 c.ClientIP() 的规范化输出（小写、压缩形式）保持一致，否则大写 IPv6 永不匹配。
 func TestNewIPSet_NormalizesExactIPs(t *testing.T) {
 	s := newIPSet([]string{"ABCD::1", "2001:0DB8::0001", "192.168.1.1"})
@@ -315,7 +311,7 @@ func TestIPLimiter_AllowedIPv6UppercaseConfig(t *testing.T) {
 	assert.Equal(t, http.StatusOK, recorder.Code)
 }
 
-// TestNewIPSet_NormalizationMatchesNetParseIP T3：切换 net/netip 后，精确条目的
+// TestNewIPSet_NormalizationMatchesNetParseIP 精确条目的
 // 归一化 key 必须与 net.ParseIP(entry).String() 逐字一致（含 4-in-6 映射地址
 // "::ffff:1.2.3.4" → "1.2.3.4"），否则既有配置会静默失配。
 func TestNewIPSet_NormalizationMatchesNetParseIP(t *testing.T) {
@@ -336,7 +332,7 @@ func TestNewIPSet_NormalizationMatchesNetParseIP(t *testing.T) {
 	}
 }
 
-// TestNewIPSet_CIDRNormalizationParity T3：netip.ParsePrefix 原样保留 host bits
+// TestNewIPSet_CIDRNormalizationParity netip.ParsePrefix 原样保留 host bits
 // 与 4-in-6 前缀，构造期必须归一对齐 net.ParseCIDR 旧语义，防止匹配行为回归。
 func TestNewIPSet_CIDRNormalizationParity(t *testing.T) {
 	// host bits 非零：旧 net.ParseCIDR("10.0.1.5/8") → network 10.0.0.0/8
@@ -350,7 +346,51 @@ func TestNewIPSet_CIDRNormalizationParity(t *testing.T) {
 	assert.False(t, s2.contains("192.168.1.1"))
 }
 
-// TestIPSet_Contains_4in6ClientIP T3：4-in-6 形式的客户端 IP（可信代理转发头
+// TestNewIPSet_PanicsOn4In6ShortPrefix 4-in-6 且前缀 <96 位的 CIDR 条目经
+// normalizePrefix 归一会把 bits 减 96 后 clamp 到 0，等价 0.0.0.0/0 匹配全部 IPv4
+// ——放进 AllowedIPs 即白名单全放行（fail-open），与「非法条目构造期 panic 避免
+// fail-open」的包哲学矛盾，故同样构造期 panic（fail-fast），消息给出等价 IPv4
+// 写法建议。要素断言形态对齐 TestNewIPSet_PanicsOnInvalidEntries。
+func TestNewIPSet_PanicsOn4In6ShortPrefix(t *testing.T) {
+	tests := []struct {
+		name  string
+		entry string
+	}{
+		{"bits为8", "::ffff:10.0.0.0/8"},
+		{"bits为0", "::ffff:0:0/0"},
+		{"bits为95边界", "::ffff:10.0.0.0/95"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer func() {
+				r := recover()
+				if !assert.NotNil(t, r, "newIPSet(%q) 应该 panic 而不是归一为 0.0.0.0/0 fail-open", tt.entry) {
+					return
+				}
+				err, ok := r.(error)
+				if assert.True(t, ok, "panic 值应为 error 类型，实际为 %T", r) {
+					msg := err.Error()
+					assert.Contains(t, msg, fmt.Sprintf("%q", tt.entry), "panic 消息应包含具体条目")
+					assert.Contains(t, msg, "0.0.0.0/0", "panic 消息应指出归一后果（匹配全部 IPv4）")
+					assert.Contains(t, msg, "fail-open", "panic 消息应警示 fail-open 后果")
+					assert.Contains(t, msg, "IPv4 CIDR", "panic 消息应建议改写为显式 IPv4 CIDR")
+					assert.Contains(t, msg, "96", "panic 消息应给出 ≥96 位前缀的改写建议")
+				}
+			}()
+			newIPSet([]string{tt.entry})
+		})
+	}
+
+	// 反例：bits ≥ 96 的 4-in-6 前缀是数学上良定义的归一（bits-96），不 panic
+	//（::ffff:10.0.0.0/104 → 10.0.0.0/8 的归一行为由 TestNewIPSet_CIDRNormalizationParity
+	// 钉住）；纯 IPv6 短前缀不受 4-in-6 判定影响，合法。
+	assert.NotPanics(t, func() { newIPSet([]string{"::ffff:10.0.0.0/96"}) },
+		"4-in-6 前缀 bits=96 恰好落在 panic 边界之外，不应 panic")
+	assert.NotPanics(t, func() { newIPSet([]string{"2001:db8::/32"}) },
+		"纯 IPv6 短前缀合法，不应 panic")
+}
+
+// TestIPSet_Contains_4in6ClientIP 4-in-6 形式的客户端 IP（可信代理转发头
 // 可能出现）经 Unmap 后应仍匹配 v4 前缀，与旧 net.ParseIP 行为一致；
 // 非法 IP 字符串不匹配任何条目。
 func TestIPSet_Contains_4in6ClientIP(t *testing.T) {

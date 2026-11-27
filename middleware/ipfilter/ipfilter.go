@@ -60,6 +60,15 @@ func newIPSet(ips []string) *ipSet {
 			if err != nil {
 				panic(fmt.Errorf("ipfilter: invalid CIDR entry %q: %w", entry, err))
 			}
+			// 4-in-6 且 bits < 96：normalizePrefix 的 bits-96 会变负并被 clamp 为 0，
+			// 条目等价 0.0.0.0/0 匹配全部 IPv4——放进 AllowedIPs 即白名单全放行
+			//（fail-open），与非法条目同样必须在构造期 panic（fail-fast）。
+			if prefix.Addr().Is4In6() && prefix.Bits() < 96 {
+				panic(fmt.Errorf("ipfilter: invalid CIDR entry %q: 4-in-6 prefix "+
+					"shorter than 96 bits normalizes to 0.0.0.0/0 and matches all "+
+					"IPv4 addresses (fail-open); use an explicit IPv4 CIDR or a "+
+					"prefix of at least 96 bits", entry))
+			}
 			s.prefixes = append(s.prefixes, normalizePrefix(prefix))
 		} else {
 			addr, err := netip.ParseAddr(entry)
@@ -88,6 +97,10 @@ func newIPSet(ips []string) *ipSet {
 //     Prefix.Contains 恒为 false，产生行为回归。
 //   - 非零 host bits 掩码化（如 "10.0.1.5/8" → 10.0.0.0/8），与 net.ParseCIDR
 //     返回的 network 一致。
+//
+// 输入域约束：bits < 96 的 4-in-6 前缀已在 newIPSet 构造期 panic 拒绝（归一会
+// clamp 成 0.0.0.0/0 匹配全部 IPv4，fail-open）；到达此处的 4-in-6 前缀 bits ≥
+// 96，减 96 后不为负，clamp 分支仅为前置约束被绕过时的兜底。
 func normalizePrefix(p netip.Prefix) netip.Prefix {
 	if addr := p.Addr(); addr.Is4In6() {
 		bits := p.Bits() - 96
