@@ -51,7 +51,7 @@ func TestTimeout_Exceeded(t *testing.T) {
 	router.ServeHTTP(recorder, req)
 
 	assert.Equal(t, http.StatusGatewayTimeout, recorder.Code)
-	// AUD-12：超时响应体遵循项目统一文本约定 "[code] msg"（原 JSON 格式违反约定）
+	// 超时响应体遵循项目统一文本约定 "[code] msg"
 	assert.Equal(t, "[504] request timeout", recorder.Body.String())
 	assert.Equal(t, "text/plain; charset=utf-8", recorder.Header().Get("Content-Type"))
 }
@@ -116,7 +116,7 @@ func TestTimeout_NoConcurrentWrite(t *testing.T) {
 	wg.Wait()
 }
 
-// AUD-13：Timeout 零值/负值会使 context.WithTimeout 立即过期，全部请求 504。
+// Timeout 零值/负值会使 context.WithTimeout 立即过期，全部请求 504。
 // 无效配置必须在构造期 panic（与 cfg.Engine 校验及项目"无效配置构造时 panic"约定一致）。
 func TestTimeout_InvalidTimeoutPanics(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -137,9 +137,9 @@ func TestTimeout_InvalidTimeoutPanics(t *testing.T) {
 	}, "正数 Timeout 配置不应 panic")
 }
 
-// AUD-03：handler panic（gin.New() 无 Recovery 场景）会穿透子 goroutine 内的
+// handler panic（gin.New() 无 Recovery 场景）会穿透子 goroutine 内的
 // Engine.ServeHTTP 逃逸，导致整个进程崩溃（原生 net/http 为 per-connection 隔离）。
-// 修复后：中间件在子 goroutine 内 recover，经 bufferWriter 返回 500，
+// 中间件在子 goroutine 内 recover，经 bufferWriter 返回 500，
 // 进程存活，后续请求不受影响。
 func TestTimeout_PanicHandlerRecovered(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -159,7 +159,7 @@ func TestTimeout_PanicHandlerRecovered(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/panic", nil)
 	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, req) // 修复前：panic 在此逃逸并崩溃测试进程
+	router.ServeHTTP(recorder, req)
 
 	assert.Equal(t, http.StatusInternalServerError, recorder.Code)
 	assert.Equal(t, "[500] internal server error", recorder.Body.String())
@@ -173,10 +173,10 @@ func TestTimeout_PanicHandlerRecovered(t *testing.T) {
 	assert.Equal(t, "ok", recorder2.Body.String())
 }
 
-// AUD-04：flushTo 曾用 Add 合并缓冲头。当外层真实 writer 已预置同名头
+// flushTo 曾用 Add 合并缓冲头。当外层真实 writer 已预置同名头
 // （典型场景：timeout 之前的中间件直写真实 writer，随后又被 Engine 重放
 // 写入缓冲 writer），Add 会使最终响应携带该头的多个值（如两个不同值的
-// X-Request-Id）。修复后 flushTo 以 Set 语义合并：内层（缓冲）值覆盖
+// X-Request-Id）。flushTo 以 Set 语义合并：内层（缓冲）值覆盖
 // 外层预置值，响应头保持单值。
 func TestTimeout_FlushToOverwritesPresetHeader(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -204,7 +204,7 @@ func TestTimeout_FlushToOverwritesPresetHeader(t *testing.T) {
 		"同名头应为单值，且内层缓冲值覆盖外层预置值")
 }
 
-// AUD-04 补充：缓冲内同名头的多值（如多条 Set-Cookie）必须完整保留且整体
+// 同头合并的补充分支：缓冲内同名头的多值（如多条 Set-Cookie）必须完整保留且整体
 // 替换外层预置值——Set 语义只针对"外层预置 vs 内层缓冲"的覆盖关系，
 // 不得把内层多值压缩为单值。
 func TestTimeout_FlushToPreservesMultiValueHeaders(t *testing.T) {
@@ -232,7 +232,7 @@ func TestTimeout_FlushToPreservesMultiValueHeaders(t *testing.T) {
 		"内层多值头应完整保留，并整体替换外层预置值")
 }
 
-// AUD-03 并发回归：recover 分支写 bufferWriter 与外层 flushTo 之间仅靠
+// 并发回归：recover 分支写 bufferWriter 与外层 flushTo 之间仅靠
 // finishChan 建立 happens-before，用 -race 钉住无数据竞争、无死锁。
 func TestTimeout_PanicHandlerConcurrent(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -416,4 +416,73 @@ func TestTimeout_RejectHandler_PanicPathNotAffected(t *testing.T) {
 	assert.Equal(t, "[500] internal server error", recorder.Body.String(),
 		"panic 恢复路径应保持默认响应")
 	assert.Equal(t, 0, callbackHits, "panic→500 路径不得触发 RejectHandler")
+}
+
+// gin v1.10.1 的 responseWriter.Flush 硬断言底层 writer 实现
+// http.Flusher（response_writer.go：w.ResponseWriter.(http.Flusher).Flush()），
+// bufferWriter 缺失 Flush 方法时，SSE/streaming handler 调 c.Writer.Flush()
+// 即 interface conversion panic——被 recover 接住后走脏恢复路径，
+// 产出 200 + "data: first\n\n[500] internal server error"。
+// Flush 为 no-op 后：不 panic、完整 body 经 flushTo 一次性落地、无
+// [500] 尾巴。
+func TestTimeout_SSEFlushNoPanic(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	router := gin.New()
+	cfg := Config{
+		Timeout: time.Second,
+		Engine:  router,
+	}
+	router.Use(New(cfg))
+	router.GET("/sse", func(c *gin.Context) {
+		// 典型 SSE 形态：手动设头 + Write + Flush 逐事件推送
+		c.Writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = c.Writer.Write([]byte("data: first\n\n"))
+		c.Writer.Flush() // bufferWriter 未实现 Flush 时此处会 interface conversion panic
+		_, _ = c.Writer.Write([]byte("data: second\n\n"))
+		c.Writer.Flush()
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/sse", nil)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	assert.Equal(t, "data: first\n\ndata: second\n\n", recorder.Body.String(),
+		"完整 SSE body 应落地，不得被恢复路径截断或污染")
+	assert.NotContains(t, recorder.Body.String(), "[500]", "不得出现 [500] 尾巴")
+	assert.Equal(t, "text/event-stream", recorder.Header().Get("Content-Type"),
+		"handler 设置的 SSE 头应经 flushTo 刷出到真实 writer")
+}
+
+// handler 先写部分 body 再 panic 时，若 recover 分支仅追加错误文案，
+// WriteHeader(500) 会被 written 守卫挡下（状态停留 200），"[500]..." 追加在
+// 半成品 body 后，产出撕裂响应——200 + "partial...[500] internal
+// server error"。正确行为是整体重写：Reset 丢弃半成品、强制 500 + 默认文案，
+// 无 partial 残留。既有 TestTimeout_PanicHandlerRecovered（panic-before-write
+// 干净路径）行为不变。
+func TestTimeout_PanicAfterPartialWriteRewritesBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	router := gin.New()
+	cfg := Config{
+		Timeout: time.Second,
+		Engine:  router,
+	}
+	router.Use(New(cfg))
+	router.GET("/panic-partial", func(c *gin.Context) {
+		c.String(http.StatusOK, "partial body before boom")
+		panic("boom")
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/panic-partial", nil)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	assert.Equal(t, http.StatusInternalServerError, recorder.Code,
+		"半成品后 panic 必须整体重写为 500，不得残留 handler 已写的 200")
+	assert.Equal(t, "[500] internal server error", recorder.Body.String(),
+		"body 必须为干净的整体重写，无 partial 残留、无追加尾巴")
+	assert.Equal(t, "text/plain; charset=utf-8", recorder.Header().Get("Content-Type"),
+		"Content-Type 应被恢复路径统一覆盖")
 }
