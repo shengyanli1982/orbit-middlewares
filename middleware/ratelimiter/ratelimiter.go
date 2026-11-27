@@ -45,7 +45,7 @@ type Config struct {
 	TTL time.Duration
 	// IPExtractor 提取限流键（客户端 IP），nil 时默认使用 c.ClientIP()。
 	//
-	// 安全边界（AUD-05）：gin 默认信任所有代理，c.ClientIP() 会优先采信
+	// 安全边界：gin 默认信任所有代理，c.ClientIP() 会优先采信
 	// X-Forwarded-For / X-Real-IP 等可被客户端伪造的头。在直接暴露于公网的
 	// 部署中，攻击者可逐请求变换伪造头获取新的限流桶，从而绕过按 IP 限流。
 	// 使用默认提取器时，必须通过 router.SetTrustedProxies（或
@@ -79,7 +79,7 @@ type limiter struct {
 // stop 用于停止后台清理 goroutine，应在不再需要时调用。
 //
 // 当 QPS <= 0（含 NaN）或 Burst <= 0 时 panic：无效配置会让
-// rate.Limiter 恒拒绝，导致所有请求被 429 锁死（AUD-08）。
+// rate.Limiter 恒拒绝，导致所有请求被 429 锁死。
 // 与项目内其他中间件（requestsize/compression/security）的构造期校验约定一致。
 func New(cfg Config) (gin.HandlerFunc, func()) {
 	// 使用 !(QPS > 0) 而非 QPS <= 0，以同时拒绝 NaN。
@@ -113,7 +113,8 @@ func New(cfg Config) (gin.HandlerFunc, func()) {
 	limitHeader := strconv.Itoa(int(math.Ceil(cfg.QPS)))
 
 	reject := func(c *gin.Context, retryAfter string) {
-		c.Header("X-RateLimit-Limit", limitHeader)
+		// 头键使用 canonical 形式，Header.Set 命中 textproto 零分配快速路径，避免每次拒绝的规范化拷贝
+		c.Header("X-Ratelimit-Limit", limitHeader)
 		c.Header("Retry-After", retryAfter)
 		if cfg.RejectHandler != nil {
 			cfg.RejectHandler(c, ReasonRateLimited)
@@ -181,7 +182,7 @@ func getShardIndex(ipStr string) int {
 		h ^= uint32(ipStr[i])
 		h *= fnvPrime32
 	}
-	// 在 uint32 域内用位与代替 int(h) % numShards（AUD-09）：
+	// 在 uint32 域内用位与代替 int(h) % numShards：
 	// 32 位平台上 h >= 2^31 时 int(h) 为负，会产生负索引导致 panic。
 	// 位与结果恒在 [0, numShards)，且对 2 的幂与取模等价。
 	return int(h & (numShards - 1))
@@ -229,7 +230,7 @@ func (l *limiter) allowIP(ipStr string) (bool, time.Duration, *rate.Reservation)
 
 // cleanupExpired 定期删除 TTL 内未活跃的 IP 限流条目，防止分片 map 无限增长。
 //
-// 设计说明（AUD-17，已接受）：本函数的 Range 读取 lastSeen 与 Delete 之间、
+// 已接受的设计取舍：本函数的 Range 读取 lastSeen 与 Delete 之间、
 // 以及与 allowIP 的 Load/LoadOrStore 之间存在 TOCTOU 窗口——若清理判定条目过期
 // 的同时恰有同 IP 请求刷新了 lastSeen，Delete 仍会删除该条目，随后的请求会
 // 获得全新满桶。后果是 TTL 边界处同一 IP 短时间内最多双倍放行（旧桶余量 +

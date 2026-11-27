@@ -49,7 +49,6 @@ func New(cfg Config) gin.HandlerFunc {
 		cfg.CSP = "default-src 'self'"
 	}
 
-	// 预计算 HSTS 值
 	var hstsValue string
 	if cfg.HSTSMaxAge > 0 {
 		var b strings.Builder

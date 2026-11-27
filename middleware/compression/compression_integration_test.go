@@ -53,9 +53,8 @@ func TestIntegration_BodyBufferPlusCompression_SmallJSON(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 
-	// 1. BodyBuffer 在 compression 之前（与 orbit 引擎一致）
+	// BodyBuffer 在 compression 之前（与 orbit 引擎一致）
 	r.Use(simBodyBuffer())
-	// 2. compression 中间件
 	r.Use(New(Config{MinLength: 1024}))
 
 	r.POST("/tdx/v1/base/query/GetSecurityList/", func(c *gin.Context) {
@@ -107,7 +106,6 @@ func TestIntegration_BodyBufferPlusCompression_SmallJSON(t *testing.T) {
 	err = json.Unmarshal(body, &parsed)
 	require.NoError(t, err, "Response body must be valid JSON (single object): %q", string(body))
 
-	// 验证是单个 JSON，没有 "Extra data"
 	dec := json.NewDecoder(bytes.NewReader(body))
 	var parsed2 map[string]any
 	err = dec.Decode(&parsed2)
@@ -176,7 +174,7 @@ func TestIntegration_BodyBufferPlusCompression_LargeJSON(t *testing.T) {
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 
-	// 如果响应有 Content-Encoding: gzip，先解压
+	// 如果响应被 gzip 压缩，先解压再校验内容
 	var decoded []byte
 	if resp.Header.Get("Content-Encoding") == "gzip" {
 		gr, err := gzip.NewReader(bytes.NewReader(body))
@@ -242,7 +240,7 @@ func TestIntegration_BodyBufferPlusCompression_KeepAliveMultipleRequests(t *test
 				"code":         fmt.Sprintf("%06d", req.Start+i),
 				"name":         fmt.Sprintf("股票%d", req.Start+i),
 				"decimalPoint": 2,
-				"preClose":     0.0, // This was NaN before SDK fix!
+				"preClose":     0.0,
 				"volumeUnit":   100,
 			})
 		}
@@ -261,7 +259,6 @@ func TestIntegration_BodyBufferPlusCompression_KeepAliveMultipleRequests(t *test
 	srv := httptest.NewServer(r)
 	defer srv.Close()
 
-	// 使用 http.Client with keep-alive (默认)
 	transport := &http.Transport{
 		DisableCompression:  true,
 		MaxIdleConns:        10,

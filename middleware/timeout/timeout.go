@@ -36,6 +36,14 @@ type Config struct {
 }
 
 // bufferWriter 缓冲响应写入器，隔离子 goroutine 与真实 writer。
+//
+// 接口边界：实现 http.ResponseWriter 的 Header/WriteHeader/Write，以及
+// http.Flusher 的 Flush（no-op，见 Flush 方法注释）。Hijacker 与
+// CloseNotifier 在缓冲模型下无法有意义地实现——底层连接由真实 writer
+// 持有，与缓冲对象生命周期解耦——故显式不做支持：handler 调用
+// c.Writer.Hijack()/CloseNotify() 会因 gin responseWriter 的接口断言
+// panic，被恢复路径转为 500。需要 Hijack/CloseNotify 语义的
+// handler 应经 Skipper 排除出 timeout 的缓冲范围。
 type bufferWriter struct {
 	mu      sync.Mutex
 	header  http.Header
@@ -106,9 +114,19 @@ func (bw *bufferWriter) Write(b []byte) (int, error) {
 	return bw.buf.Write(b)
 }
 
+// Flush 实现 http.Flusher，为 no-op。
+//
+// gin 的 responseWriter.Flush 会硬断言底层 writer 实现 http.Flusher，
+// 缓冲 writer 缺失该方法时，SSE/streaming handler 调 c.Writer.Flush()
+// 即 interface conversion panic（被恢复路径接住，产出撕裂响应）。缓冲
+// 模型下数据在 handler 结束后由 flushTo 一次性刷出，Flush 无即时送达
+// 语义可提供，故实现为 no-op：消除 panic 的同时保持缓冲语义不变。
+// no-op 不触碰任何状态，无需加锁。
+func (bw *bufferWriter) Flush() {}
+
 // flushTo 将缓冲响应刷写到真实 writer。
 //
-// AUD-04：头合并按 key 整体替换（等价于首值 Set + 余值 Add）：外层真实
+// 头合并按 key 整体替换（等价于首值 Set + 余值 Add）：外层真实
 // writer 可能已预置同名头（如 timeout 之前的中间件直写真实 writer 后又被
 // Engine 重放），逐值 Add 会使最终响应携带多个值（如两个 X-Request-Id）；
 // 整体替换令内层（缓冲）值成为唯一权威，并天然保留缓冲内多值（如多条
@@ -188,14 +206,23 @@ func New(cfg Config) gin.HandlerFunc {
 
 		go func() {
 			defer func() { finishChan <- struct{}{} }()
-			// AUD-03：gin.New() 无 Recovery 时，handler panic 会穿透 ServeHTTP
-			// 逃逸子 goroutine 并崩溃整个进程。此处 recover 后经 bw 返回 500；
-			// 该 defer 按 LIFO 先于 finishChan 通知执行，bw/finishChan 既有
-			// 同步协议不变（外层只在收到 finishChan 后才读 bw）。
+			// gin.New() 无 Recovery 时，handler panic 会穿透 ServeHTTP
+			// 逃逸子 goroutine 并崩溃整个进程。此处 recover 后整体重写缓冲响应：
+			// Reset 丢弃半成品 body、强制置 500 后写入统一错误文案。此刻 bw 为
+			// 子 goroutine 私有、flushTo 尚未发生，客户端尚未见到任何字节，
+			// 整体重写是缓冲模型的核心优势——否则 WriteHeader(500)
+			// 会因 written 守卫被挡下，产生「200 + 半成品 body + 追加 [500]
+			// 文案」的撕裂响应。该 defer 按 LIFO 先于 finishChan 通知执行，
+			// bw/finishChan 既有同步协议不变（外层只在收到 finishChan 后才读 bw）。
 			defer func() {
 				if recover() != nil {
-					bw.Header().Set("Content-Type", "text/plain; charset=utf-8")
-					bw.WriteHeader(http.StatusInternalServerError)
+					bw.mu.Lock()
+					bw.buf.Reset()
+					bw.code = http.StatusInternalServerError
+					bw.written = true
+					bw.header.Set("Content-Type", "text/plain; charset=utf-8")
+					bw.mu.Unlock()
+					// Write 自持锁，须在 Unlock 后调用，避免双重加锁死锁。
 					_, _ = bw.Write([]byte("[500] internal server error"))
 				}
 			}()
@@ -211,14 +238,17 @@ func New(cfg Config) gin.HandlerFunc {
 			// 最后一个 defer 中发信），bw 不再被任何方引用。刻意不用 defer Put——
 			// 若外层在超时分支 <-finishChan 之前意外 panic，defer 会把子 goroutine
 			// 仍在写入的 bw 归还池，引发跨请求数据竞争；显式 Put 使 panic 路径
-			// 仅丢弃对象（牺牲一次复用换正确性）。子 goroutine panic（AUD-03）
+			// 仅丢弃对象（牺牲一次复用换正确性）。子 goroutine panic
 			// 已在子 goroutine 内 recover，外层仍正常走本分支，归还路径不受影响。
 			putBufferWriter(bw)
 			c.Abort()
 		case <-ctx.Done():
 			// 超时，拒绝（默认 504，项目统一 "[code] msg" 文本约定）
 			reject(c)
-			// 等待子 goroutine 退出，防止泄漏
+			// 等待子 goroutine 退出——目的是 bw 不再被引用后安全归还池对象，
+			// 而非「防止泄漏」：不感知 ctx 取消的 handler 会运行到自然结束，
+			// 此处等待时长与其一致、无上限（README 约束：handler 必须感知
+			// ctx 取消才能真正约束资源占用）。
 			<-finishChan
 			// 子 goroutine 已退出，bw 不再被引用，安全归还（未刷写的缓冲内容随复位丢弃）
 			putBufferWriter(bw)

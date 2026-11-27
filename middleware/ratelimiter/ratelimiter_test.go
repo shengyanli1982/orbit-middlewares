@@ -186,7 +186,7 @@ func TestRateLimiter_Skipper(t *testing.T) {
 	assert.Equal(t, http.StatusTooManyRequests, recorder3.Code)
 }
 
-// TestNew_InvalidConfigPanics 钉住 AUD-08：零值/非法 Config 必须在构造时 panic，
+// TestNew_InvalidConfigPanics 钉住构造期校验：零值/非法 Config 必须在构造时 panic，
 // 否则 rate.NewLimiter(0, 0) 会恒拒绝，导致 100% 锁死。
 func TestNew_InvalidConfigPanics(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -251,7 +251,7 @@ func fnvHash32a(s string) uint32 {
 	return h.Sum32()
 }
 
-// TestGetShardIndex_HighBitHashStaysInRange 钉住 AUD-09：
+// TestGetShardIndex_HighBitHashStaysInRange 钉住分片索引安全契约：
 // 对哈希高位为 1（h >= 2^31）的输入，分片索引必须落在 [0, numShards)
 // 且等于 uint32 域内取模的数学结果。
 // 旧实现 int(h) % numShards 在 32 位平台上 int(h) 为负，产生负索引导致 panic
@@ -314,7 +314,7 @@ func serveOnce(router *gin.Engine) *httptest.ResponseRecorder {
 	return recorder
 }
 
-// TestRateLimiter_RejectHandler_CustomResponse 钉住 AUD-18 与统一拒绝契约：
+// TestRateLimiter_RejectHandler_CustomResponse 钉住统一拒绝契约：
 // 自定义 RejectHandler 写入的状态码与响应体生效，回调收到 ReasonRateLimited。
 func TestRateLimiter_RejectHandler_CustomResponse(t *testing.T) {
 	var gotReason string
@@ -337,7 +337,7 @@ func TestRateLimiter_RejectHandler_CustomResponse(t *testing.T) {
 	assert.Equal(t, ReasonRateLimited, gotReason, "回调应收到 ReasonRateLimited")
 }
 
-// TestRateLimiter_RejectHandler_SeesPresetHeaders 钉住 AUD-18：
+// TestRateLimiter_RejectHandler_SeesPresetHeaders 钉住预设头契约：
 // 回调执行前 X-RateLimit-Limit 与 Retry-After 已写入响应头，回调内可见，
 // 且最终随响应返回；回调收到 ReasonRateLimited。
 // 注意：gin 的 c.GetHeader 读的是请求头，响应头必须经 c.Writer.Header() 读取。
@@ -370,7 +370,7 @@ func TestRateLimiter_RejectHandler_SeesPresetHeaders(t *testing.T) {
 	assert.Equal(t, "1", recorder.Header().Get("Retry-After"))
 }
 
-// TestRateLimiter_RejectHandler_AbortEnforced 钉住 AUD-18 与统一拒绝契约：
+// TestRateLimiter_RejectHandler_AbortEnforced 钉住统一拒绝契约：
 // 回调内不调用 Abort，外层 reject 仍无条件 Abort，后续路由处理器不得执行。
 func TestRateLimiter_RejectHandler_AbortEnforced(t *testing.T) {
 	routeHits := 0
@@ -397,7 +397,7 @@ func TestRateLimiter_RejectHandler_AbortEnforced(t *testing.T) {
 	assert.Equal(t, 1, routeHits, "拒绝后外层必须 Abort，路由处理器不得再次执行")
 }
 
-// TestRateLimiter_RejectHandler_NilUsesDefault 钉住 AUD-18：
+// TestRateLimiter_RejectHandler_NilUsesDefault 钉住默认拒绝行为：
 // 未配置 RejectHandler 时使用默认 429 响应体。
 func TestRateLimiter_RejectHandler_NilUsesDefault(t *testing.T) {
 	cfg := Config{
@@ -414,4 +414,6 @@ func TestRateLimiter_RejectHandler_NilUsesDefault(t *testing.T) {
 	assert.Equal(t, "[429] rate limit exceeded", recorder.Body.String())
 	assert.Equal(t, "2", recorder.Header().Get("X-RateLimit-Limit"))
 	assert.Equal(t, "1", recorder.Header().Get("Retry-After"))
+	// 限流头以 canonical 键名写入 header map，钉住精确 wire 键名
+	assert.Contains(t, recorder.Header(), "X-Ratelimit-Limit")
 }

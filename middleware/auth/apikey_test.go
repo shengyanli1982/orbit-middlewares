@@ -282,8 +282,8 @@ func TestAPIKeyAuth_RejectHandler_NilUsesDefault(t *testing.T) {
 	}
 }
 
-// P2-1：APIKeys 与 Validator 均未配置时，valid 恒为 false，全请求 401 锁死。
-// 无效配置必须 fail-fast，在构造期 panic，与 JWTAuth 零值校验（AUD-02）及
+// APIKeys 与 Validator 均未配置时，valid 恒为 false，全请求 401 锁死。
+// 无效配置必须 fail-fast，在构造期 panic，与 JWTAuth 零值校验及
 // 项目"无效配置构造时 panic"约定一致。
 func TestAPIKeyAuth_ZeroConfigPanics(t *testing.T) {
 	gin.SetMode(gin.TestMode)

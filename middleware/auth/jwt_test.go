@@ -171,7 +171,7 @@ func TestJWTAuth_Skipper(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, recorder2.Code)
 }
 
-// AUD-02：Secret 与 KeyFunc 均未配置（含显式空 Secret）时，
+// Secret 与 KeyFunc 均未配置（含显式空 Secret）时，
 // 空密钥会使 jwt/v5 HMAC 验签对任何人自签的 token 放行（fail-open），
 // 必须在构造期 panic，与项目"无效配置构造时 panic"约定一致。
 func TestJWTAuth_ZeroConfigPanics(t *testing.T) {
@@ -193,8 +193,8 @@ func TestJWTAuth_ZeroConfigPanics(t *testing.T) {
 	}, "仅提供 KeyFunc 的配置不应 panic")
 }
 
-// AUD-02 PoC 回归：攻击者用空密钥 SignedString([]byte{}) 自签任意 token，
-// 在任何情况下都不得通过认证。修复后零值配置在构造期即 panic（源头杜绝），
+// 空密钥伪造回归：攻击者用空密钥 SignedString([]byte{}) 自签任意 token，
+// 在任何情况下都不得通过认证。零值配置在构造期即 panic（源头杜绝），
 // 本测试钉住端到端安全语义。
 func TestJWTAuth_ForgedEmptyKeyTokenRejected(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -207,7 +207,7 @@ func TestJWTAuth_ForgedEmptyKeyTokenRejected(t *testing.T) {
 	authenticated := false
 	func() {
 		defer func() {
-			// 修复后构造期 panic 即视为拒绝，安全语义满足
+			// 构造期 panic 即视为拒绝，安全语义满足
 			recover()
 		}()
 
@@ -228,7 +228,7 @@ func TestJWTAuth_ForgedEmptyKeyTokenRejected(t *testing.T) {
 	assert.False(t, authenticated, "空密钥伪造 token 不得通过认证（AUD-02 PoC）")
 }
 
-// AUD-16：RFC 7235 §2.1 规定 auth-scheme 大小写不敏感，
+// RFC 7235 §2.1 规定 auth-scheme 大小写不敏感，
 // "bearer "/"BEARER " 等合法变体不应被 401 拒绝。
 func TestJWTAuth_BearerSchemeCaseInsensitive(t *testing.T) {
 	gin.SetMode(gin.TestMode)

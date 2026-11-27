@@ -51,13 +51,12 @@ func TestRequestSizeLimiter_LargeBody(t *testing.T) {
 	body := strings.NewReader("this body is too large")
 	req := httptest.NewRequest(http.MethodPost, "/test", body)
 	req.Header.Set("Content-Type", "application/octet-stream")
-	// 显式设置 Content-Length 超限，触发快速拒绝路径
 	req.ContentLength = int64(len("this body is too large"))
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, req)
 
 	assert.Equal(t, http.StatusRequestEntityTooLarge, recorder.Code)
-	// AUD-12：响应体必须遵循项目统一约定 "[code] msg"，不允许空 body
+	// 响应体必须遵循项目统一约定 "[code] msg"，不允许空 body
 	assert.Equal(t, "[413] request entity too large", recorder.Body.String())
 }
 
@@ -126,7 +125,7 @@ func TestRequestSizeLimiter_ChunkedSmallBody(t *testing.T) {
 	assert.Equal(t, "small", recorder.Body.String())
 }
 
-// TestRequestSizeLimiter_NoBodyNotWrapped T4：net/http server 对无 body 的请求
+// TestRequestSizeLimiter_NoBodyNotWrapped net/http server 对无 body 的请求
 // （GET 等）置 http.NoBody，对其包装 MaxBytesReader 无意义；断言中间件跳过
 // 包装后 Body 保持原值（省一次 *maxBytesReader 分配）。
 func TestRequestSizeLimiter_NoBodyNotWrapped(t *testing.T) {
@@ -162,7 +161,7 @@ func TestRequestSizeLimiter_NoBodyNotWrapped(t *testing.T) {
 	assert.Nil(t, seenBody, "Body==nil 的请求不应被包装")
 }
 
-// TestRequestSizeLimiter_RealBodyStillWrapped T4：带真实 body 的 POST 必须仍被
+// TestRequestSizeLimiter_RealBodyStillWrapped 带真实 body 的 POST 必须仍被
 // MaxBytesReader 包装——Content-Length 未知（-1）时超限只能在读取期暴露，
 // 断言 413 行为不变（若未包装，io.ReadAll 将成功并返回 200）。
 func TestRequestSizeLimiter_RealBodyStillWrapped(t *testing.T) {

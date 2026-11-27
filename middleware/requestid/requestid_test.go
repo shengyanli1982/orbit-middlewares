@@ -27,6 +27,8 @@ func TestRequestID(t *testing.T) {
 	assert.Equal(t, http.StatusOK, recorder.Code)
 	assert.NotEmpty(t, recorder.Body.String())
 	assert.NotEmpty(t, recorder.Header().Get("X-Request-ID"))
+	// 响应头以 canonical 键名写入 header map，钉住精确 wire 键名
+	assert.Contains(t, recorder.Header(), "X-Request-Id")
 }
 
 func TestRequestID_HeaderExists(t *testing.T) {
@@ -59,6 +61,8 @@ func TestRequestID_CustomHeader(t *testing.T) {
 	router.ServeHTTP(recorder, req)
 
 	assert.NotEmpty(t, recorder.Header().Get("X-Custom-ID"))
+	// 自定义头名同样以 canonical 键名写入，钉住精确 wire 键名
+	assert.Contains(t, recorder.Header(), "X-Custom-Id")
 }
 
 func TestRequestID_Skipper(t *testing.T) {
