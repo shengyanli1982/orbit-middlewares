@@ -20,6 +20,7 @@ A production-ready middleware toolkit for Go services built on [Gin](https://git
 | `Timeout`     | Deadline control     | Per-request timeout with goroutine-safe implementation |
 | `Compression` | Response compression | GZIP with configurable level and path exclusions       |
 | `Security`    | Security headers     | CSP, HSTS, X-Frame-Options, and more                   |
+| `AutoIndex`   | Static file serving  | Apache-style directory index + file downloads (terminal handler, mount via `NoRoute`) |
 
 ## Quick Start
 
@@ -248,8 +249,9 @@ engine.RegisterMiddleware(timeout.New(timeout.Config{
 }))
 ```
 
-- Returns `504 Gateway Timeout` with body `"[504] request timeout"` if the deadline is exceeded; the background goroutine is always waited on before returning, preventing goroutine leaks
-- Handler panics are recovered inside the worker goroutine and returned as `500` with body `"[500] internal server error"` — the process stays up
+- Returns `504 Gateway Timeout` with body `"[504] request timeout"` when the deadline is exceeded; the middleware then waits for the handler goroutine to finish so its buffer can be reclaimed. A handler that ignores `c.Request.Context()` cancellation runs to completion — make handlers context-aware to truly bound request resources
+- `c.Writer.Flush()` is a no-op — the buffered response is delivered in one shot when the handler finishes, so SSE events are not streamed incrementally; `Hijack`/`CloseNotify` are unsupported (they panic into the 500 recovery path) — exclude such handlers via `Skipper`
+- Handler panics are recovered in the worker goroutine and returned as `500` with body `"[500] internal server error"`; a half-written body is discarded and rewritten — the process stays up
 - Panics at construction time when `Engine` is nil or `Timeout <= 0`
 - Buffered response headers replace same-named headers preset on the outer writer, so replayed middleware cannot duplicate header values
 
@@ -307,6 +309,64 @@ Headers set: `X-Frame-Options`, `X-Content-Type-Options`, `Strict-Transport-Secu
 
 ---
 
+### AutoIndex
+
+Apache `mod_autoindex`-style directory listing plus static file downloads. Unlike the nine pipeline middleware above, this is a **terminal handler**: it generates the response body itself and does not call `c.Next()` on the served path (a `Skipper` hit passes through via `c.Next()`). Mount it as the `NoRoute` fallback — gin's global `Use` middleware automatically wraps the `NoRoute` chain, so pipeline middleware still applies.
+
+```go
+// orbit engine
+engine.GetGinEngine().NoRoute(autoindex.New(autoindex.Config{
+    Root: "./public",
+}))
+
+// bare gin
+r := gin.New()
+r.NoRoute(autoindex.New(autoindex.Config{
+    Root:        "./public",
+    IndexIgnore: []string{".git", "*.tmp"},
+}))
+```
+
+- Renders an Apache-style HTML listing for directories: `Parent Directory` link, folders first, `Name` / `Last modified` / `Size` columns
+- Sorting via query parameters — `?C=N|M|S` (name / mtime / size) and `?O=A|D` (ascending / descending); column headers are self-links that toggle order; ties always break by name ascending
+- `IndexIgnore` hides entries from the listing by glob pattern (`path.Match` semantics; unlike Apache, `[abc]` character classes work)
+- Files are served via `http.ServeContent`: `Range` → `206`, `If-Modified-Since` → `304`, `HEAD` supported
+- The listing page declares `Content-Length` — it is rendered in memory in one pass, so the exact byte count is known up front (net/http only auto-fills it for bodies ≤ 2048 bytes, and a listing page is always larger); no chunked framing, matching Apache `mod_autoindex` / nginx `autoindex`. `HEAD` on a directory returns the same `Content-Length` as `GET`, with an empty body
+- Only `GET` and `HEAD` are served — other methods get `405 Method Not Allowed` with `Allow: GET, HEAD` and body `"[405] method not allowed"`, matching Apache `mod_autoindex` / nginx `autoindex`
+- Directory URLs without a trailing slash get a `301` redirect (query string preserved; `Location` is re-percent-encoded so directory names containing `?` / `#` / `%` / spaces stay intact)
+- Traversal outside `Root` and filesystem permission errors (`EACCES`) return `403 Forbidden` with `"[403] forbidden"`; missing paths return `404`; open/read failures after a successful stat (fd exhaustion, I/O error) return `500` with `"[500] internal server error"`
+- Panics at construction time when `Root` is empty / missing / not a directory, or an `IndexIgnore` pattern is malformed (fail-fast)
+
+**Mounting & conflict avoidance:**
+
+- **`NoRoute` only** (or a non-root prefix catch-all like `/files/*filepath`). In a `Use` chain it would stat the filesystem on every request and shadow your routes. Under orbit, do **not** pair it with root-level `StaticFS("/")` — its catch-all route conflicts with the built-in `/ping` / `/metrics` and panics
+- **A prefix catch-all does not strip the prefix**: the handler maps the **full** URL path onto `Root` (`filepath.Join(Root, URL.Path)`), so a `/files/*filepath` mount resolves `/files/a.txt` to `Root/files/a.txt`, **not** `Root/a.txt` — the intuitive `Root: "./public"` will `404`. Point `Root` at a dir that contains a matching `files/` subdir, or (recommended) mount at `NoRoute` with `Root` as the real content root:
+
+    ```go
+    r.GET("/files/*filepath", autoindex.New(autoindex.Config{Root: "./public"}))  // /files/a.txt → public/files/a.txt
+    r.NoRoute(autoindex.New(autoindex.Config{Root: "./public/files"}))            // /a.txt       → public/files/a.txt (1:1)
+    ```
+
+- **A prefix mount needs `HEAD` registered separately**: gin's `r.GET` does not route `HEAD`, so under a `/files/*filepath` prefix mount `HEAD` never reaches the handler — also register `r.HEAD("/files/*filepath", h)`. Under a `NoRoute` mount **every** method reaches the handler, where non-`GET`/`HEAD` methods get the `405` above — i.e. the method gate only fires under `NoRoute`
+- **With Compression**: `206` (Range) and `304` responses are automatically exempted from compression — their headers and slice bytes pass through unchanged, so no exclusion is required for correctness (excluding download paths is now optional, e.g. to save CPU). The listing HTML itself is safe to compress:
+
+    ```go
+    compression.New(compression.Config{ExcludedPaths: []string{"/downloads/"}}) // optional since 206/304 are auto-exempted
+    ```
+
+- **With Timeout**: timeout buffers the whole response in memory — large downloads risk OOM and get cut off with `504`. Exclude download paths via `Skipper`, or don't mount timeout on a pure static service:
+
+    ```go
+    timeout.New(timeout.Config{Engine: r, Timeout: 10 * time.Second,
+        Skipper: func(c *gin.Context) bool { return strings.HasPrefix(c.Request.URL.Path, "/downloads/") }})
+    ```
+
+- **With Security**: the default CSP `default-src 'self'` blocks the listing page's inline `<style>` — the page loses its styling but **every link and download keeps working**. Accept the plain look, or relax `style-src`
+- **Write timeout**: orbit resets `WithHttpWriteTimeout(0)` to its 15s default, which would truncate large downloads. AutoIndex already clears the per-connection write deadline on the download branch — nothing to configure
+- **`IndexIgnore` is not access control** — it only hides entries from the listing; hidden files are still served on direct request. Never put secrets inside `Root`
+
+---
+
 ## Skipper
 
 Every middleware accepts an optional `Skipper` function to bypass processing for specific requests:
@@ -351,6 +411,7 @@ RejectHandler func(c *gin.Context, reason string)
 | `RateLimiter` | `ratelimiter.Config.RejectHandler`    | `ReasonRateLimited` = `ratelimit.exceeded`                                | rate limit exceeded              |
 | `RequestSize` | `requestsize.Config.RejectHandler`    | `ReasonEntityTooLarge` = `request.entity_too_large`                       | Content-Length fast reject       |
 | `Timeout`     | `timeout.Config.RejectHandler`        | `ReasonTimeout` = `request.timeout`                                       | 504 request timeout              |
+| `AutoIndex`   | `autoindex.Config.RejectHandler`      | `ReasonForbidden` = `autoindex.forbidden`, `ReasonPermission` = `autoindex.permission` | path traversal outside root / filesystem permission denied (EACCES) |
 
 Example — uniform JSON reject responses for `IPFilter`:
 
@@ -373,7 +434,7 @@ Coverage notes:
 
 Runnable demos live in [`examples/`](./examples) — one subdirectory per example, as a separate Go module wired to the repo root via `replace`.
 
-Available: `apikey`, `combined`, `compression`, `ipfilter`, `jwt`, `ratelimiter_global`, `ratelimiter_ip`, `requestid`, `requestsize`, `security`, `timeout`.
+Available: `apikey`, `autoindex`, `combined`, `compression`, `ipfilter`, `jwt`, `ratelimiter_global`, `ratelimiter_ip`, `requestid`, `requestsize`, `security`, `timeout`.
 
 ```bash
 cd examples
